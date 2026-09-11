@@ -288,15 +288,19 @@ recorded in `bootloader/vendor/MANIFEST.md`.
 
 ## License
 
-No single license covers the tree, and one has not yet been chosen for the
-original work. What is here:
+**MIT**, with two directories that carry their own terms and cannot be
+relicensed:
 
 | part | license |
 |---|---|
-| `patches/linux/` | GPL-2.0 — these are patches against the Linux kernel |
-| `bootloader/vendor/` | Apache-2.0 — vendored from ESP-IDF, unmodified |
-| `config/*.why2025`, the patches taken from it | as why2025-linux ships them |
-| everything else (`bootloader/p4/`, `board/hget/`, `dts/`, `tools/`, docs) | original work, no license declared yet |
+| `patches/linux/` | **GPL-2.0-only.** These are patches against the Linux kernel; a patch is a derivative work of the file it modifies, so it inherits the kernel's license. Not a choice this repository makes. See `patches/linux/README.md` |
+| `bootloader/vendor/` | **Apache-2.0** (63 of the files dual Apache-2.0 OR MIT). Vendored unmodified from ESP-IDF with the per-file SPDX headers intact; redistributed under Espressif's terms, not relicensed. Provenance in `bootloader/vendor/MANIFEST.md` |
+| everything else | **MIT** — `bootloader/p4/`, `board/` (including `board/hget/`), `dts/`, `tools/`, `config/`, `docs/` |
 
-Until a `LICENSE` file is added, the original work is under default
-copyright. GPL-2.0 is the natural fit given what it sits next to.
+A built bootloader binary links the vendored Apache-2.0 sources, so the
+binary carries an Apache-2.0 attribution obligation even though the code
+written here is MIT. The licenses are compatible; that is attribution, not
+conflict. `hget` links mbedTLS, which is dual Apache-2.0 OR
+GPL-2.0-or-later — taken as Apache-2.0, so MIT applies to `hget` itself.
+
+See [`LICENSE`](LICENSE).

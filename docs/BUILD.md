@@ -27,7 +27,7 @@ SD card rather than in flash.
 |---|---|
 | kernel | Linux 6.18.35 LTS |
 | buildroot | 2025.02.15 (the checkout under `~/why2025-linux/buildroot`) |
-| patches | 12 of why2025's 35, plus one of ours — see below |
+| patches | 12 of why2025's 35, plus six of ours — see below |
 | toolchain | riscv32 uClibc, `rv32imac`, ilp32, `BINFMT_FLAT` |
 
 ### Patch series
@@ -59,6 +59,11 @@ Ours:
 | # | what |
 |---|---|
 | 0012 | `arch/riscv/boot/dts/espressif/esp32p4-function-ev.dts` + its Makefile. Replaces why2025's 0012 (badge DTS) and 0020 (badge watchdog node) |
+| 0035 | `dw_mmc` FIFO-mode device-tree property |
+| 0036 | `dw_mmc` IDMAC descriptor-ring invalidate. Without it the OWN-bit poll reads the stale line the CPU wrote itself, spins 100 ms per descriptor, and any directory read hangs |
+| 0037 | `__sramtext` — hot kernel text linked into internal SRAM at 0x4FF40000. Default off |
+| 0039 | `arch_dma_set_uncached()` through the +0x40000000 non-cacheable alias, which is what makes `dma_alloc_coherent()` real on this part |
+| 0040 | `ARCH_HAS_VALID_PHYS_ADDR_RANGE` so `/dev/mem` reaches peripheral space and the aliases — register debugging on a running kernel without a reflash |
 
 Dropped — 22 patches, all badge hardware we do not have: MIPI-DSI and the
 ST7703 panel (0003, 0004, 0033), the ESP32-C6 and everything behind it
