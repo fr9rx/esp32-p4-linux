@@ -1,0 +1,31 @@
+esp32-p4-linux -- licensing scope
+=================================
+
+The LICENSE file at the root of this repository is the MIT license, and
+it covers the original work here. It does not cover the whole tree.
+
+Two directories carry their own terms and are not MIT:
+
+  patches/linux/        GPL-2.0-only.  These are patches against the Linux
+                        kernel.  A patch is a derivative work of the file it
+                        modifies, so it inherits the kernel's license; this
+                        is not a choice the repository makes.  See
+                        patches/linux/README.md.
+
+  bootloader/vendor/    Apache-2.0, and a further 63 files Apache-2.0 OR MIT.
+                        Vendored unmodified from ESP-IDF, with the per-file
+                        SPDX headers intact and the provenance recorded in
+                        bootloader/vendor/MANIFEST.md.  Redistributed under
+                        Espressif's terms, not relicensed.
+
+Everything else -- bootloader/p4/, board/ (including board/hget/), dts/,
+tools/, config/ and docs/ -- is original work under the MIT license above.
+
+Note that a built bootloader binary links the vendored Apache-2.0 sources,
+so the binary must carry Apache-2.0 attribution even though the sources
+written here are MIT.  The two licenses are compatible; this is an
+attribution obligation, not a conflict.
+
+Per-file SPDX headers are authoritative where present: the vendored
+ESP-IDF sources carry theirs unmodified, and patches/linux/README.md
+carries GPL-2.0-only for that directory.

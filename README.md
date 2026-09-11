@@ -303,4 +303,5 @@ written here is MIT. The licenses are compatible; that is attribution, not
 conflict. `hget` links mbedTLS, which is dual Apache-2.0 OR
 GPL-2.0-or-later — taken as Apache-2.0, so MIT applies to `hget` itself.
 
-See [`LICENSE`](LICENSE).
+See [`LICENSE`](LICENSE) for the MIT text and [`NOTICE`](NOTICE)
+for the scope.
