@@ -1,0 +1,54 @@
+#!/bin/sh
+#
+# Set the clock. There is no RTC on this board.
+#
+# WHY THIS IS NOT OPTIONAL IF YOU WANT TLS. The clock starts at the epoch
+# every boot, and mbedTLS checks certificate validity against the system
+# time, so with a 1970 clock every certificate on the internet is "not yet
+# valid" -- including perfectly good ones:
+#
+#   # hget https://example.com/
+#   hget: certificate rejected:
+#     The certificate validity starts in the future
+#
+# Setting the clock is the whole fix; nothing about the TLS configuration
+# or the CA bundle was ever wrong.
+#
+# S45, i.e. after S40network: this needs DNS and a route, both of which
+# come from the DHCP lease that S40network waits for.
+#
+# `ntpd -q` sets the clock once and exits rather than staying resident to
+# discipline it. That is the right trade here -- the clock is thrown away
+# at the next power cycle either way, and a daemon would be one more
+# process holding a contiguous allocation out of the NOMMU pool.
+#
+# `timeout` is what keeps a boot with no internet from hanging here: -q
+# will otherwise keep trying indefinitely, and this runs before the login
+# prompt.
+
+NTP_SERVERS="pool.ntp.org time.cloudflare.com"
+NTP_TIMEOUT=20
+
+case "$1" in
+	start)
+		printf "Setting clock via NTP: "
+		if timeout "$NTP_TIMEOUT" ntpd -q -n -p "${NTP_SERVERS%% *}" \
+				-p "${NTP_SERVERS##* }" >/dev/null 2>&1; then
+			echo "OK, $(date)"
+		else
+			echo "FAILED (clock stays at $(date +%Y); https will refuse"
+			echo "  certificates until you set it: date -s 'YYYY-MM-DD HH:MM:SS')"
+		fi
+		;;
+	stop)
+		;;
+	restart|reload)
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0

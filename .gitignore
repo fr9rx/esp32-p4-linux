@@ -1,7 +1,11 @@
 # Bootloader build output. `make` in bootloader/ regenerates all of it.
-*.o
-*.d
-*.map
+#
+# These are scoped to bootloader/ rather than written as bare *.o / *.d,
+# because a gitignore pattern matches directories too and `*.d` silently
+# swallowed board/overlay/etc/init.d/ -- a directory of real source.
+bootloader/**/*.o
+bootloader/**/*.d
+bootloader/*.map
 bootloader/bootloader.elf
 bootloader/bootloader.bin
 bootloader/partitions.bin
