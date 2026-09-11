@@ -1,0 +1,142 @@
+[2026-09-07T23:32:57Z INFO ] Serial port: 'COM17'
+[2026-09-07T23:32:57Z INFO ] Connecting...
+[2026-09-07T23:32:57Z INFO ] Using flash stub
+^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@
+p4boot: console now at 4000000 baud (xtal 40000000 Hz)
+p4boot: reset reason 0x01 (power-on)
+p4boot: flash: chip_size 2 MB -> 16 MB
+p4boot: partition table at 0x00008000:
+p4boot:   type 0x40 sub 0x00  0x00020000 + 0x00a00000  10240 KB  kernel
+p4boot:   type 0x41 sub 0x00  0x00a20000 + 0x00010000  64 KB  dtb
+p4boot: crc32 of kernel (0x00020000 + 0x00a00000)
+..........
+p4boot:   kernel crc32 0xc52ac046
+p4boot: crc32 of dtb (0x00a20000 + 0x00010000)
+p4boot:   dtb crc32 0x29f0fff9
+p4boot: cache/MMU HAL initialised
+p4boot: mpll: xtal 40 MHz -> mpll 320 MHz
+I (0) hex_psram: vendor id    : 0x0d (AP)
+I (0) hex_psram: Latency      : 0x01 (Fixed)
+I (0) hex_psram: DriveStr.    : 0x00 (25 Ohm)
+I (0) hex_psram: dev id       : 0x03 (generation 4)
+I (0) hex_psram: density      : 0x07 (256 Mbit)
+I (0) hex_psram: good-die     : 0x06 (Pass)
+I (0) hex_psram: SRF          : 0x02 (Slow Refresh)
+I (0) hex_psram: BurstType    : 0x00 ( Wrap)
+I (0) hex_psram: BurstLen     : 0x03 (2048 Byte)
+I (0) hex_psram: BitMode      : 0x01 (X16 Mode)
+I (0) hex_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (0) hex_psram: DriveStrength: 0x00 (1/1)
+I (0) MSPI Timing: Enter psram timing tuning
+p4boot: PSRAM 32768 KB mapped at 0x48000000 (80 MHz)
+p4boot: PSRAM 32768 KB verified at 40 MHz CPU
+p4boot: CPU at 40 MHz, raising to 360...
+p4boot: CPU now at 360 MHz (readback)
+p4boot: PSRAM 32768 KB verified
+p4boot: copying kernel to 0x48000000
+..........
+p4boot:   kernel verified in PSRAM (crc32 0xc52ac046)
+p4boot: copying dtb to 0x49000000
+p4boot:   dtb verified in PSRAM (crc32 0x29f0fff9)
+p4boot: first words at 0x48000000: 0x0000a085 0x00010000
+p4boot: SDMMC slot 0 ready: LDO4 3.3 V, bus clock on, LS clock PLL160M/4 = 40 MHz, pads 39-44 func 0
+p4boot: cache writeback, then jumping to 0x48000000 (dtb 0x49000000)
+[    0.000000] Linux version 6.18.35 (lenovo@DESKTOP-PVQQJ9H) (riscv32-buildroot-linux-uclibc-gcc.br_real (Buildroot 2025.02.15-dirty) 13.4.0, GNU ld (GNU Binutils) 2.43.1) #2 Tue Sep  8 02:19:32 +03 2026
+[    0.000000] Machine model: Espressif ESP32-P4-Function-EV-Board
+[    0.000000] earlycon: esp32p4uart0 at MMIO 0x500ca000 (options '4000000n8')
+[    0.000000] printk: legacy bootconsole [esp32p4uart0] enabled
+[    0.000000] nommu_userspace_pool: reserved 10240 KiB at 0x49600000 for user mmap allocations
+[    0.000000] OF: reserved mem: initialized node app-pool@49600000, compatible id linux,nommu-userspace-pool
+[    0.000000] OF: reserved mem: 0x49600000..0x49ffffff (10240 KiB) map non-reusable app-pool@49600000
+[    0.000000] Zone ranges:
+[    0.000000]   Normal   [mem 0x0000000048000000-0x0000000049ffffff]
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000048000000-0x0000000049ffffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000048000000-0x0000000049ffffff]
+[    0.000000] Falling back to deprecated "riscv,isa"
+[    0.000000] riscv: base ISA extensions acim
+[    0.000000] riscv: ELF capabilities acim
+[    0.000000] Ticket spinlock: enabled
+[    0.000000] pcpu-alloc: s0 r0 d32768 u32768 alloc=1*32768
+[    0.000000] pcpu-alloc: [0] 0 
+[    0.000000] Kernel command line: earlycon console=ttyS0,4000000 rw loglevel=8
+[    0.000000] printk: log buffer data + meta data: 65536 + 204800 = 270336 bytes
+[    0.000000] Dentry cache hash table entries: 2048 (order: 1, 8192 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 8192
+[    0.000000] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+[    0.000000] SLUB: HWalign=64, Order=0-1, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] NR_IRQS: 64, nr_irqs: 64, preallocated irqs: 0
+[    0.000000] riscv-intc: 32 local interrupts mapped
+[    0.000000] esp32p4-clic: 240 IRQ slots, INTMTX routing enabled
+[    0.000000] clocksource: esp32p4-systimer: mask: 0xfffffffffffff max_cycles: 0x3b0a9be80, max_idle_ns: 440795202120 ns
+[    0.000009] sched_clock: 52 bits at 16MHz, resolution 62ns, wraps every 2199023255531ns
+[    0.000484] esp32p4-systimer: SYSTIMER @ 16000000 Hz, IRQ 17 (CLIC slot 17)
+[    0.001141] Console: colour dummy device 80x25
+[    0.001300] Calibrating delay loop (skipped), value calculated using timer frequency.. 32.00 BogoMIPS (lpj=64000)
+[    0.001416] pid_max: default: 4096 minimum: 301
+[    0.002113] Mount-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.002287] Mountpoint-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.010350] Memory: 14180K/32768K available (2822K kernel code, 976K rwdata, 1064K rodata, 2804K init, 129K bss, 18360K reserved, 0K cma-reserved)
+[    0.013001] devtmpfs: initialized
+[    0.019388] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+[    0.019731] posixtimers hash table entries: 512 (order: 0, 2048 bytes, linear)
+[    0.019879] nommu_userspace_pool: 10240 KiB at 0x49600000 serves NOMMU user mmap allocations
+[    0.024612] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.049815] cpu0: Ratio of byte access time to unaligned word access is 1.47, unaligned accesses are fast
+[    0.050144] esp32p4_cache: registered ROM-thunk noncoherent ops, block=64
+[    0.069154] clocksource: Switched to clocksource esp32p4-systimer
+[    0.099228] NET: Registered PF_INET protocol family
+[    0.100542] IP idents hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.103265] tcp_listen_portaddr_hash hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.103559] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.103651] TCP established hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.103828] TCP bind hash table entries: 1024 (order: 1, 8192 bytes, linear)
+[    0.104127] TCP: Hash tables configured (established 1024 bind 1024)
+[    0.105442] UDP hash table entries: 256 (order: 0, 4096 bytes, linear)
+[    0.105698] UDP-Lite hash table entries: 256 (order: 0, 4096 bytes, linear)
+[    0.106686] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.109073] Initialise system trusted keyrings
+[    0.131278] workingset: timestamp_bits=30 max_order=12 bucket_order=0
+[    0.835199] Key type asymmetric registered
+[    0.835377] Asymmetric key parser 'x509' registered
+[    0.835679] io scheduler mq-deadline registered
+[    1.417491] 500ca000.serial: ttyS0 at MMIO 0x500ca000 (irq = 18, base_baud = 2500000) is a ESP32-P4 UART
+[    1.417810] printk: legacy console [ttyS0] enabled
+[    1.417810] printk: legacy console [ttyS0] enabled
+[    1.417907] printk: legacy bootconsole [esp32p4uart0] disabled
+[    1.417907] printk: legacy bootconsole [esp32p4uart0] disabled
+[    1.420495] i2c_dev: i2c /dev entries driver
+[    1.421377] Synopsys Designware Multimedia Card Interface Driver
+[    1.423498] NET: Registered PF_INET6 protocol family
+[    1.426669] dw_mmc 50083000.mmc: fifo-depth property not found, using value of FIFOTH register as default
+[    1.426991] dw_mmc 50083000.mmc: IDMAC supports 32-bit address mode.
+[    1.427073] coherent DMA allocations not supported on this platform.
+[    1.427328] dw_mmc 50083000.mmc: IDMAC: cached descriptor ring with manual cache sync
+[    1.427409] dw_mmc 50083000.mmc: Using internal DMA controller.
+[    1.427538] dw_mmc 50083000.mmc: Version ID is 270a
+[    1.427785] dw_mmc 50083000.mmc: DW MMC controller at irq 22,32 bit host data width,512 deep fifo
+[    1.429643] mmc_host mmc0: card is polling.
+[    1.434785] Segment Routing with IPv6
+[    1.435229] In-situ OAM (IOAM) with IPv6
+[    1.435594] NET: Registered PF_PACKET protocol family
+[    1.442974] Loading compiled-in X.509 certificates
+[    1.446408] mmc_host mmc0: Bus speed (slot 0) = 40000000Hz (slot req 400000Hz, actual 400000HZ div = 50)
+[    1.447801] clk: Disabling unused clocks
+M-oM-?M-=[    1.526868] Freeing unused kernel image (initmem) memory: 2800K
+[    1.527104] This architecture does not have kernel memory protection.
+[    1.527264] Run /init as init process
+[    1.527317]   with arguments:
+[    1.527368]     /init
+[    1.527411]   with environment:
+[    1.527454]     HOME=/
+[    1.527516]     TERM=linux
+[    1.822300] mmc_host mmc0: Bus speed (slot 0) = 40000000Hz (slot req 25000000Hz, actual 20000000HZ div = 1)
+[    2.031668] mmc0: new SDXC card at address 5048
+[    2.047105] mmcblk0: mmc0:5048 SD128 116 GiB
+[    2.090309]  mmcblk0: p1 p2
+Saving 256 bits of non-creditable seed for next boot
+
+ESP32-P4 Function EV Board
+^Mp4ev login: 

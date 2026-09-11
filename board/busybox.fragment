@@ -1,0 +1,157 @@
+# busybox additions on top of package/busybox/busybox-minimal.config,
+# merged via BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES.
+#
+# Derived from why2025's fragment with inetd and ntpd removed -- both
+# existed to serve the badge's ESP32-C6 radio (SSH over Wi-Fi, and an NTP
+# sync because the badge has no RTC). This board has no C6 and no network,
+# so they are dead weight.
+#
+# SIZE MATTERS HERE, and not for flash reasons. binfmt_flat copies
+# text+data+bss+stack into ONE physically contiguous allocation per exec,
+# capped by MAX_PAGE_ORDER -- which is the default 10 in this tree, so
+# 4 MB. busybox is exec'd constantly, so its footprint sets the floor for
+# how fragmented memory can get before the shell itself stops forking.
+#
+# why2025 measured busybox 1.37.0 (riscv32-uclibc FLAT) at 579,104 B
+# baseline and 613,216 B with vi + inetd + ntpd. Dropping inetd and ntpd
+# should land a little under that. Check it after any change to this file:
+#
+#   host/bin/riscv32-linux-flthdr target/bin/busybox
+#
+# and keep it well clear of 1 MB.
+
+# vi -- the editor that always works, because it has no library
+# dependency. Feature set copied from why2025's measured selection.
+#
+# REGEX_SEARCH is deliberately off: it drags uClibc's regex through
+# elf2flt, which nobody here has measured. ALLOW_EXEC is off as in
+# busybox-minimal, so ':!cmd' is compiled out -- which is the right call
+# on NOMMU anyway, where every shell-out is another contiguous
+# allocation.
+CONFIG_VI=y
+CONFIG_FEATURE_VI_MAX_LEN=4096
+# CONFIG_FEATURE_VI_8BIT is not set
+CONFIG_FEATURE_VI_COLON=y
+CONFIG_FEATURE_VI_COLON_EXPAND=y
+CONFIG_FEATURE_VI_YANKMARK=y
+CONFIG_FEATURE_VI_SEARCH=y
+# CONFIG_FEATURE_VI_REGEX_SEARCH is not set
+CONFIG_FEATURE_VI_USE_SIGNALS=y
+CONFIG_FEATURE_VI_DOT_CMD=y
+CONFIG_FEATURE_VI_READONLY=y
+CONFIG_FEATURE_VI_SETOPTS=y
+CONFIG_FEATURE_VI_SET=y
+CONFIG_FEATURE_VI_WIN_RESIZE=y
+CONFIG_FEATURE_VI_ASK_TERMINAL=y
+CONFIG_FEATURE_VI_UNDO=y
+CONFIG_FEATURE_VI_UNDO_QUEUE=y
+CONFIG_FEATURE_VI_UNDO_QUEUE_MAX=256
+# CONFIG_FEATURE_VI_VERBOSE_STATUS is not set
+
+# Removed from why2025's fragment (no network on this board):
+#   CONFIG_INETD  -- SSH front-end, vfork+exec'd dropbear per connection
+#   CONFIG_NTPD   -- one-shot time sync after Wi-Fi associated
+
+# free -- ask for it and you get it. Reports MemTotal/MemFree the way any
+# other Linux does, reading /proc/meminfo, which the kernel already provides.
+# Costs a few hundred bytes.
+CONFIG_FREE=y
+
+# The three applets needed to own the SD card from the board itself.
+#
+# There is no card reader on the host, so the card can only be partitioned and
+# formatted by the board -- which means these have to be in the rootfs that
+# does the work, not just in the one that results from it.
+#
+# FDISK_WRITABLE is the half that matters and is off in busybox-minimal:
+# without it fdisk can read a partition table and not write one.
+#
+# MKFS_EXT2 is the only way to make a filesystem here, so the SD rootfs is
+# ext2 -- no journal. e2fsprogs, which would give a real mkfs.ext4 plus
+# e2fsck, is NOT available on this target:
+#
+#   package/e2fsprogs/Config.in:
+#     depends on BR2_USE_MMU # util-linux/libblkid
+#
+# and this is a NOMMU build, so BR2_USE_MMU is off and the package is
+# unselectable. Nothing to work around -- ext2 is a perfectly real filesystem,
+# it just cannot replay a journal after a bad shutdown. Use `sync` before
+# pulling power and it is fine.
+CONFIG_FDISK=y
+CONFIG_FEATURE_FDISK_WRITABLE=y
+CONFIG_MKFS_EXT2=y
+
+# ---------------------------------------------------------------------
+# DHCP needs mktemp, and nothing said so.
+#
+# udhcpc itself was already built and worked fine -- it sent DISCOVERs and
+# the interface was up at 100 Mbps full duplex. What failed was buildroot's
+# own /usr/share/udhcpc/default.script, which builds resolv.conf through a
+# temporary file:
+#
+#   udhcpc: executing /usr/share/udhcpc/default.script deconfig
+#   sh: can't execute 'mktemp': No such file or directory
+#
+# So the client died in its config script before it ever assigned an
+# address, and every symptom pointed at the Ethernet driver instead. One
+# missing applet.
+CONFIG_MKTEMP=y
+
+# FEATURE_FANCY_PING is what gives ping its options. Without it `ping -c 3`
+# is parsed as a request to resolve the host "-c", which is a confusing way
+# to find out:
+#
+#   ping: bad address '-c'
+#
+# Only `ping HOST` works, and it never terminates. Wanted for any real
+# diagnosis, not just convenience.
+CONFIG_PING=y
+CONFIG_PING6=y
+CONFIG_FEATURE_FANCY_PING=y
+
+# Found missing while testing: `find` and `time` are both routinely reached
+# for and neither was built.
+CONFIG_FIND=y
+CONFIG_FEATURE_FIND_TYPE=y
+CONFIG_FEATURE_FIND_MAXDEPTH=y
+CONFIG_FEATURE_FIND_EXEC=y
+CONFIG_TIME=y
+
+# nslookup, so DNS can be checked independently of whether a fetch works.
+CONFIG_NSLOOKUP=y
+
+# wget removed: curl is the HTTP client on this board.
+#
+# Keeping both meant two implementations of the same job, and the busybox one
+# is the weaker of the two here -- it has no TLS at all:
+#
+#   # wget -q -O /tmp/s.html https://example.com/
+#   wget: not an http or ftp url: https://example.com/
+#
+# so anything over HTTPS needed curl regardless. Dropping it also removes the
+# temptation to reach for wget when curl misbehaves, which hid a real curl
+# bug for a while.
+# CONFIG_WGET is not set
+
+# ntpd and timeout, because this board has no RTC.
+#
+# The clock starts at the epoch on every boot, and TLS does not survive
+# that: mbedTLS checks certificate validity against the system time, so
+# every certificate on the internet is "not yet valid" and every https
+# fetch fails, valid chains included:
+#
+#   # hget https://example.com/
+#   hget: TLS handshake failed (-0x2700)     <- MBEDTLS_ERR_X509_CERT_VERIFY_FAILED
+#   # date -s "2026-09-11 15:30:00"; hget https://example.com/
+#   * TLS TLSv1.3, TLS1-3-CHACHA20-POLY1305-SHA256
+#   < HTTP 200
+#
+# ntpd -q sets the clock once and exits, which is all that is wanted;
+# there is no need to discipline a clock that will be thrown away at the
+# next power cycle. timeout bounds it, so a boot with no route to the
+# internet costs seconds rather than hanging /etc/init.d/S45ntp forever.
+CONFIG_NTPD=y
+# CONFIG_FEATURE_NTPD_SERVER is not set
+# CONFIG_FEATURE_NTPD_CONF is not set
+CONFIG_FEATURE_NTP_AUTH=y
+CONFIG_TIMEOUT=y

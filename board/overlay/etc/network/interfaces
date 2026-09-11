@@ -1,0 +1,41 @@
+# Network interfaces, brought up by /etc/init.d/S40network at boot.
+#
+# This file is in the rootfs overlay rather than generated from
+# BR2_SYSTEM_DHCP so that it can carry the comment below, which is the one
+# thing about Ethernet on this board that is not obvious.
+#
+# WAIT FOR CARRIER BEFORE ASKING FOR A LEASE.
+#
+# The IP101G takes a couple of seconds to autonegotiate from reset, and
+# nothing in `ifup` blocks on it. The kernel brings eth0 up at about 3 s and
+# the PHY only reports link at about 6 s:
+#
+#   [ 3.891006] stmmaceth 50098000.ethernet eth0: configuring for phy/rmii link mode
+#   [ 6.063808] stmmaceth 50098000.ethernet eth0: Link is Up - 100Mbps/Full
+#
+# A DISCOVER sent in that window goes into a dead cable, udhcpc burns its
+# retries and gives up, and the board ends up with no address on a network
+# that was working the whole time.
+#
+# THE `ip link set eth0 up` IN pre-up IS NOT REDUNDANT. ifupdown runs pre-up
+# BEFORE it brings the interface up, and reading carrier on a down interface
+# does not return 0, it returns EINVAL:
+#
+#   # cat /sys/class/net/eth0/carrier
+#   cat: read error: Invalid argument
+#
+# so a wait loop placed here without it never sees carrier at all -- it just
+# burns its whole timeout every boot and then hands udhcpc the same dead
+# cable it was meant to avoid. Bringing the link up first is what makes the
+# loop mean anything. Doing it twice is harmless; ifupdown's own `ip link set
+# up` that follows is a no-op on an interface that is already up.
+#
+# The trailing `true` matters: a timeout should still let the interface come
+# up and let udhcpc try, rather than failing the boot.
+
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+	pre-up ip link set eth0 up; i=0; while [ $i -lt 30 ]; do [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ] && break; i=$((i+1)); sleep 0.5; done; true

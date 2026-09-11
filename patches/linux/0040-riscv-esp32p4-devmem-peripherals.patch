@@ -1,0 +1,100 @@
+riscv: esp32p4: let /dev/mem reach peripherals and the uncached aliases
+
+Bringing up a SoC with no upstream support means reading peripheral registers
+on a running kernel constantly: is this block clocked, did the DMA stall, what
+does the MAC think its status is. /dev/mem is the obvious tool and it refuses:
+
+    # dd if=/dev/mem bs=4 count=2 skip=$((0x50098000/4))
+    dd: /dev/mem: Bad address
+
+because the generic rule in drivers/char/mem.c is
+
+    return addr + count <= __pa(high_memory);
+
+and on this board high_memory is 0x4A000000, the end of the 32 MB memory
+node. Every peripheral register sits above it, as do both non-cacheable
+aliases at +0x40000000, so the read fails in valid_phys_addr_range() before
+it ever reaches the bus.
+
+riscv does not define ARCH_HAS_VALID_PHYS_ADDR_RANGE, so add it for this SoC
+with an explicit list of the ranges worth reaching -- PSRAM, internal SRAM,
+both aliases, and the HP/LP peripheral windows -- and nothing else. Same
+pattern arm uses.
+
+Without this, every "what is that register doing" question costs a kernel
+patch and a reflash. With it, dd answers it.
+
+Signed-off-by: f23 <ali@connectedmotion.io>
+diff -urN a/arch/riscv/include/asm/io.h b/arch/riscv/include/asm/io.h
+--- a/arch/riscv/include/asm/io.h	2026-06-09 13:28:53.000000000 +0300
++++ b/arch/riscv/include/asm/io.h	2026-09-10 21:00:33.635135574 +0300
+@@ -144,4 +144,69 @@
+ 	((__force void *)ioremap_prot((addr), (size), __pgprot(_PAGE_KERNEL)))
+ #endif
+ 
++#ifdef CONFIG_SOC_ESP32P4
++/*
++ * Let /dev/mem reach the peripheral window and the uncached aliases.
++ *
++ * The generic rule in drivers/char/mem.c is
++ *
++ *     return addr + count <= __pa(high_memory);
++ *
++ * which on this board stops at 0x4A000000, the end of the 32 MB memory node.
++ * Every peripheral register and both non-cacheable aliases are above that, so
++ * a read of one returns EFAULT from valid_phys_addr_range() before it ever
++ * reaches the bus:
++ *
++ *     # dd if=/dev/mem bs=4 count=2 skip=$((0x50098000/4))
++ *     dd: /dev/mem: Bad address
++ *
++ * That makes /dev/mem useless for the one thing it is wanted for here.
++ * Bringing up a SoC with no upstream support means reading peripheral
++ * registers on a running kernel constantly -- "is this block clocked", "did
++ * the DMA stall", "what does the MAC think its status is" -- and the
++ * alternative is a kernel patch and a reflash per question.
++ *
++ * The ranges below are the ones worth reaching, and nothing else:
++ *
++ *   0x48000000 + 64M   PSRAM             (the memory node lives in here)
++ *   0x88000000 + 64M   PSRAM uncached alias
++ *   0x4FF00000 + 768K  internal SRAM
++ *   0x8FF00000 + 768K  internal SRAM uncached alias
++ *   0x50000000 .. 0x50130000  HP and LP peripherals
++ *
++ * This widens what root can poke at, which on a development board is the
++ * point. CONFIG_STRICT_DEVMEM still applies on top if it is ever turned on.
++ */
++#define ARCH_HAS_VALID_PHYS_ADDR_RANGE
++
++static inline int valid_phys_addr_range(phys_addr_t addr, size_t count)
++{
++	phys_addr_t end;
++
++	if (!count)
++		return 0;
++	end = addr + count;
++	if (end < addr)			/* wrapped */
++		return 0;
++
++	if (addr >= 0x48000000UL && end <= 0x4c000000UL)
++		return 1;		/* PSRAM */
++	if (addr >= 0x88000000UL && end <= 0x8c000000UL)
++		return 1;		/* PSRAM, uncached alias */
++	if (addr >= 0x4ff00000UL && end <= 0x4ffc0000UL)
++		return 1;		/* internal SRAM */
++	if (addr >= 0x8ff00000UL && end <= 0x8ffc0000UL)
++		return 1;		/* internal SRAM, uncached alias */
++	if (addr >= 0x50000000UL && end <= 0x50130000UL)
++		return 1;		/* HP + LP peripherals */
++
++	return 0;
++}
++
++static inline int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
++{
++	return 1;
++}
++#endif /* CONFIG_SOC_ESP32P4 */
++
+ #endif /* _ASM_RISCV_IO_H */

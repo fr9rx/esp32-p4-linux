@@ -1,0 +1,353 @@
+--- a/include/linux/mm_types.h	2026-04-30 11:13:53.000000000 +0200
++++ b/include/linux/mm_types.h	2026-05-05 11:14:25.133479238 +0200
+@@ -687,6 +687,8 @@
+ 	int		vm_usage;	/* region usage count (access under nommu_region_sem) */
+ 	bool		vm_icache_flushed : 1; /* true if the icache has been flushed for
+ 						* this region */
++	bool		vm_from_pool : 1;      /* allocated from
++					* nommu_userspace_pool */
+ };
+ 
+ #ifdef CONFIG_USERFAULTFD
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/include/linux/nommu_userspace_pool.h	2026-05-05 11:14:25.133623280 +0200
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Reserved-memory pool for large NOMMU user-space mmap allocations.
++ *
++ * See Documentation/devicetree/bindings/reserved-memory/
++ * linux,nommu-userspace-pool.yaml for the binding and the rationale.
++ */
++#ifndef _LINUX_NOMMU_USERSPACE_POOL_H
++#define _LINUX_NOMMU_USERSPACE_POOL_H
++
++#include <linux/types.h>
++
++#ifdef CONFIG_NOMMU_USERSPACE_POOL
++
++/*
++ * Try to allocate a contiguous range of @size bytes (page-aligned by the
++ * caller) from the configured reserved pool. Returns a kernel-virtual
++ * pointer on success, NULL if the pool is unavailable or out of space.
++ */
++void *nommu_userspace_pool_alloc(size_t size);
++
++/*
++ * Free a region previously returned by nommu_userspace_pool_alloc().
++ * @addr must be the exact pointer returned, @size the exact size passed.
++ */
++void nommu_userspace_pool_free(void *addr, size_t size);
++
++#else /* !CONFIG_NOMMU_USERSPACE_POOL */
++
++static inline void *nommu_userspace_pool_alloc(size_t size)
++{
++	return NULL;
++}
++
++static inline void nommu_userspace_pool_free(void *addr, size_t size)
++{
++}
++
++#endif /* CONFIG_NOMMU_USERSPACE_POOL */
++
++#endif /* _LINUX_NOMMU_USERSPACE_POOL_H */
+--- a/mm/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/mm/Kconfig	2026-05-05 11:14:25.133721780 +0200
+@@ -761,6 +761,28 @@
+ 	depends on MEMORY_FAILURE && DEBUG_KERNEL && PROC_FS
+ 	select PROC_PAGE_MONITOR
+ 
++config NOMMU_USERSPACE_POOL
++	bool "Reserved-memory pool for large NOMMU user mmap allocations"
++	depends on !MMU && OF_RESERVED_MEM
++	select GENERIC_ALLOCATOR
++	help
++	  On NOMMU systems every private user mmap (fork+exec of a
++	  binfmt_flat binary, anonymous malloc, brk-grown heap) is satisfied
++	  by ONE physically contiguous page range from the buddy allocator.
++	  Small NOMMU machines fragment the buddy heap quickly, leaving
++	  several megabytes of free memory but no free blocks of the order
++	  needed to fork a non-trivial process or to malloc more than a few
++	  hundred kilobytes. CONFIG_CMA — the usual answer — depends on MMU.
++
++	  Saying Y here lets a platform device tree describe a reserved
++	  memory region (compatible "linux,nommu-userspace-pool") that the
++	  NOMMU mmap path will draw large user allocations from before
++	  falling back to the buddy allocator.
++
++	  When this option is enabled but no DT node is present, the hook
++	  is a no-op and the buddy fallback is used unconditionally.
++	  If unsure, say N.
++
+ config NOMMU_INITIAL_TRIM_EXCESS
+ 	int "Turn on mmap() excess space trimming before booting"
+ 	depends on !MMU
+--- a/mm/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/mm/Makefile	2026-05-05 11:14:25.133839822 +0200
+@@ -146,3 +146,4 @@
+ obj-$(CONFIG_EXECMEM) += execmem.o
+ obj-$(CONFIG_TMPFS_QUOTA) += shmem_quota.o
+ obj-$(CONFIG_PT_RECLAIM) += pt_reclaim.o
++obj-$(CONFIG_NOMMU_USERSPACE_POOL) += nommu_userspace_pool.o
+--- a/mm/nommu.c	2026-04-30 11:13:53.000000000 +0200
++++ b/mm/nommu.c	2026-05-05 11:14:25.133958281 +0200
+@@ -34,6 +34,7 @@
+ #include <linux/syscalls.h>
+ #include <linux/audit.h>
+ #include <linux/printk.h>
++#include <linux/nommu_userspace_pool.h>
+ 
+ #include <linux/uaccess.h>
+ #include <linux/uio.h>
+@@ -542,8 +543,13 @@
+ 
+ 		/* IO memory and memory shared directly out of the pagecache
+ 		 * from ramfs/tmpfs mustn't be released here */
+-		if (region->vm_flags & VM_MAPPED_COPY)
+-			free_page_series(region->vm_start, region->vm_top);
++		if (region->vm_flags & VM_MAPPED_COPY) {
++			if (region->vm_from_pool)
++				nommu_userspace_pool_free((void *)region->vm_start,
++							  region->vm_top - region->vm_start);
++			else
++				free_page_series(region->vm_start, region->vm_top);
++		}
+ 		kmem_cache_free(vm_region_jar, region);
+ 	} else {
+ 		up_write(&nommu_region_sem);
+@@ -956,7 +962,25 @@
+ 	if (sysctl_nr_trim_pages && total - point >= sysctl_nr_trim_pages)
+ 		total = point;
+ 
+-	base = alloc_pages_exact(total << PAGE_SHIFT, GFP_KERNEL);
++	/*
++	 * Try the platform-supplied reserved pool (NOMMU_USERSPACE_POOL)
++	 * before the buddy allocator. The pool gives byte-precise,
++	 * page-aligned allocations and can hand out ranges larger than
++	 * MAX_PAGE_ORDER, which is what saves us when buddy is too
++	 * fragmented to honour a non-trivial fork+exec or a large malloc.
++	 *
++	 * On the buddy fallback path we keep the existing power-of-two
++	 * rounding (with the optional NOMMU_INITIAL_TRIM_EXCESS trim).
++	 * Pool allocations are not power-of-two rounded â there is no
++	 * need, the pool can give exactly point pages.
++	 */
++	base = nommu_userspace_pool_alloc(point << PAGE_SHIFT);
++	if (base) {
++		total = point;
++		region->vm_from_pool = 1;
++	} else {
++		base = alloc_pages_exact(total << PAGE_SHIFT, GFP_KERNEL);
++	}
+ 	if (!base)
+ 		goto enomem;
+ 
+@@ -993,7 +1017,11 @@
+ 	return 0;
+ 
+ error_free:
+-	free_page_series(region->vm_start, region->vm_top);
++	if (region->vm_from_pool)
++		nommu_userspace_pool_free((void *)region->vm_start,
++					  region->vm_top - region->vm_start);
++	else
++		free_page_series(region->vm_start, region->vm_top);
+ 	region->vm_start = vma->vm_start = 0;
+ 	region->vm_end   = vma->vm_end = 0;
+ 	region->vm_top   = 0;
+@@ -1414,7 +1442,16 @@
+ 	add_nommu_region(region);
+ 	up_write(&nommu_region_sem);
+ 
+-	free_page_series(from, to);
++	/*
++	 * [from, to) is always a sub-range of the region's original single
++	 * gen_pool_alloc() -- gen_pool is a flat page-granularity bitmap
++	 * allocator with no "free as one block" requirement, so a partial
++	 * free here is safe.
++	 */
++	if (region->vm_from_pool)
++		nommu_userspace_pool_free((void *)from, to - from);
++	else
++		free_page_series(from, to);
+ 	return 0;
+ }
+ 
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/mm/nommu_userspace_pool.c	2026-05-05 11:14:25.134066532 +0200
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Reserved-memory pool for large NOMMU user-space mmap allocations.
++ *
++ * On NOMMU, every private mmap (fork+exec, anonymous malloc, brk-grown
++ * heap) is satisfied by ONE physically contiguous page range. The
++ * buddy allocator fragments quickly on small (tens of MB) NOMMU
++ * machines, leaving plenty of nominal free memory but no free blocks
++ * of the order a non-trivial fork+exec needs. CONFIG_CMA — the
++ * standard answer — depends on MMU.
++ *
++ * This file implements a small generic mechanism: a DT-described
++ * reserved range, served by a gen_pool, that the NOMMU mmap path
++ * draws from before falling back to alloc_pages_exact(). See
++ * Documentation/devicetree/bindings/reserved-memory/
++ * linux,nommu-userspace-pool.yaml for the binding.
++ */
++
++#define pr_fmt(fmt) "nommu_userspace_pool: " fmt
++
++#include <linux/genalloc.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/mm.h>
++#include <linux/nommu_userspace_pool.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/printk.h>
++#include <linux/sizes.h>
++
++static struct gen_pool *user_pool;
++
++/*
++ * Captured at early-boot RESERVEDMEM_OF_DECLARE time and consumed by
++ * the core_initcall that actually builds the gen_pool — gen_pool_create
++ * needs the slab allocator, which is not yet available when reserved
++ * memory regions are first parsed.
++ */
++static phys_addr_t pool_phys __initdata;
++static size_t pool_size __initdata;
++
++void *nommu_userspace_pool_alloc(size_t size)
++{
++	unsigned long va;
++
++	if (!user_pool || !size)
++		return NULL;
++
++	va = gen_pool_alloc(user_pool, size);
++	return (void *)va; /* 0 → NULL on failure, which is what we want */
++}
++
++void nommu_userspace_pool_free(void *addr, size_t size)
++{
++	if (!user_pool || !addr)
++		return;
++	gen_pool_free(user_pool, (unsigned long)addr, size);
++}
++
++static int __init nommu_userspace_pool_init(void)
++{
++	void *va;
++	int ret;
++
++	if (!pool_size)
++		return 0;
++
++	user_pool = gen_pool_create(PAGE_SHIFT, NUMA_NO_NODE);
++	if (!user_pool) {
++		pr_err("gen_pool_create failed\n");
++		return -ENOMEM;
++	}
++
++	/*
++	 * Reserved-memory regions registered via RESERVEDMEM_OF_DECLARE
++	 * are excluded from the buddy allocator (memblock_reserve) but
++	 * remain part of the kernel direct map and have struct pages.
++	 * phys_to_virt is therefore the right address translation here;
++	 * no ioremap is needed and the memory is cached, matching how
++	 * userspace expects to see its text/data.
++	 */
++	va = phys_to_virt(pool_phys);
++
++	ret = gen_pool_add_virt(user_pool, (unsigned long)va, pool_phys,
++				pool_size, NUMA_NO_NODE);
++	if (ret) {
++		pr_err("gen_pool_add_virt failed: %d\n", ret);
++		gen_pool_destroy(user_pool);
++		user_pool = NULL;
++		return ret;
++	}
++
++	pr_info("%zu KiB at %pa serves NOMMU user mmap allocations\n",
++		pool_size / SZ_1K, &pool_phys);
++	return 0;
++}
++core_initcall(nommu_userspace_pool_init);
++
++static int __init nommu_userspace_pool_rmem(struct reserved_mem *rmem)
++{
++	if (pool_size) {
++		pr_warn("multiple pool regions declared; ignoring %pa\n",
++			&rmem->base);
++		return -EINVAL;
++	}
++
++	pool_phys = rmem->base;
++	pool_size = rmem->size;
++	pr_info("reserved %zu KiB at %pa for user mmap allocations\n",
++		pool_size / SZ_1K, &pool_phys);
++	return 0;
++}
++RESERVEDMEM_OF_DECLARE(nommu_userspace_pool, "linux,nommu-userspace-pool",
++		       nommu_userspace_pool_rmem);
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/Documentation/devicetree/bindings/reserved-memory/linux,nommu-userspace-pool.yaml	2026-05-05 11:14:25.133114154 +0200
+@@ -0,0 +1,57 @@
++# SPDX-License-Identifier: GPL-2.0
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/reserved-memory/linux,nommu-userspace-pool.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Reserved pool for large NOMMU user-space mmap allocations
++
++description: |
++  On systems built without an MMU (CONFIG_MMU=n), every userspace mmap
++  for a private mapping is satisfied by a single physically contiguous
++  page range obtained from the buddy allocator. After a few minutes of
++  normal activity the buddy heap on a small NOMMU box (tens of MB)
++  routinely fragments below the order needed to fork a non-trivial
++  binfmt_flat binary or to malloc more than a few hundred kilobytes,
++  even though several megabytes of memory remain free.
++
++  CONFIG_CMA — the standard answer on MMU systems — depends on MMU
++  and is not available. This binding describes a reserved memory
++  region which the kernel's NOMMU mmap path will draw large user
++  allocations from before falling back to the buddy allocator.
++
++  The region is served by a gen_pool created at early boot. Pool
++  allocations are page-aligned but not power-of-two-rounded, so the
++  pool is denser than buddy for binfmt_flat allocations and can hand
++  out single allocations larger than MAX_PAGE_ORDER.
++
++maintainers:
++  - Rory Breuk <rory.breuk@gmail.com>
++
++allOf:
++  - $ref: reserved-memory.yaml
++
++properties:
++  compatible:
++    const: linux,nommu-userspace-pool
++
++  reg: true
++
++unevaluatedProperties: false
++
++required:
++  - compatible
++  - reg
++
++examples:
++  - |
++    reserved-memory {
++        #address-cells = <1>;
++        #size-cells = <1>;
++
++        app_pool: app-pool@49200000 {
++            compatible = "linux,nommu-userspace-pool";
++            reg = <0x49200000 0x00a00000>;
++        };
++    };
++...

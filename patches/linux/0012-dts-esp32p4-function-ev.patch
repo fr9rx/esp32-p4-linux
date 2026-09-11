@@ -1,0 +1,409 @@
+Board DTS for the ESP32-P4-Function-EV-Board.
+
+Replaces why2025 patches 0012 (badge DTS) and 0020 (badge watchdog node),
+which are dropped from this series. The systimer LEVEL_HIGH change that
+why2025 patch 0022 made to the badge DTS is folded in here too, so 0022
+carries only its driver hunk.
+
+Every badge-only peripheral is gone: MIPI-DSI, ST7703 panel, backlight,
+the ESP32-C6 over spi-gpio, the i2c-gpio bus with keypad and sensors, the
+WS2812B LEDs, and the mtd-rom rootfs window. Root is ext4 on microSD.
+
+--- /dev/null
++++ b/arch/riscv/boot/dts/espressif/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++dtb-$(CONFIG_SOC_ESP32P4) += esp32p4-function-ev.dtb
+--- /dev/null
++++ b/arch/riscv/boot/dts/espressif/esp32p4-function-ev.dts
+@@ -0,0 +1,390 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Espressif ESP32-P4-Function-EV-Board — native NOMMU Linux on the HP core
++ *
++ * Derived from the WHY2025 badge DTS (why2025-linux patch 0012) with every
++ * badge-only peripheral removed. What is left is chip-level and applies to
++ * any ESP32-P4 board that brings out UART0 and a microSD on slot 0.
++ *
++ *   SoC        ESP32-P4 rev v1.0 (hw_ver1 register layout)
++ *   HP core    RV32IMAFC at 360 MHz, M-mode, NOMMU, single core
++ *   RAM        32 MB HEX PSRAM at 0x48000000, 80 MHz
++ *   Flash      16 MB, DIO — carries the bootloader, kernel and this DTB only
++ *   Root       ext4 on microSD (dw_mmc slot 0), NOT flash
++ *   Console    UART0 at 0x500CA000, 4 Mbps
++ *   SYSTIMER   16 MHz free-running counter (XTAL 40 MHz / 2.5) = timebase
++ *
++ * Removed relative to the badge: MIPI-DSI host, ST7703 panel, backlight,
++ * ESP32-C6 over spi-gpio (esp-hosted Wi-Fi/BT), i2c-gpio bus with TCA8418
++ * keypad + BME680 + BMI270, WS2812B LEDs, and the `mtd-rom` flash@deadbeef
++ * rootfs window. That last one matters for the bootloader: with the rootfs
++ * on SD there is no placeholder `reg` to patch at runtime, so this DTB is a
++ * static blob the bootloader copies verbatim.
++ *
++ * Folded in from patches that used to edit the badge DTS, so those patches
++ * are dropped from the series:
++ *   0020  wdt0 node                                   (see watchdog@500c2000)
++ *   0022  systimer trigger EDGE_RISING -> LEVEL_HIGH  (see timer@500e2000)
++ *
++ * ---------------------------------------------------------------------
++ * WHAT THE BOOTLOADER MUST HAVE DONE BEFORE JUMPING HERE
++ *
++ * Linux has no ESP32-P4 clock, pinctrl or LDO driver, so several nodes
++ * below are deliberate fictions: fixed-clock stubs and always-on fixed
++ * regulators that describe state the bootloader is expected to have
++ * established. If any of these is not true, the matching driver does not
++ * fail loudly — it computes the wrong divisor or probes an unpowered
++ * device.
++ *
++ *   1. UART0 configured 4000000 8N1, SCLK = XTAL (40 MHz), clkdiv = 10.
++ *      40e6 / 4e6 is exactly 10, so no fractional divisor is involved —
++ *      unlike 115200, which needs 347 + 4/16.
++ *   2. SDMMC clocks in HP_SYS_CLKRST: source PLL_F160M, host divider 4,
++ *      giving the 40 MHz biu/ciu that sdmmc_{biu,ciu}_clk below claim.
++ *   3. SDMMC slot-0 IOMUX routed, function 0:
++ *         GPIO39=D0 GPIO40=D1 GPIO41=D2 GPIO42=D3 GPIO43=CLK GPIO44=CMD
++ *      These are the P4's dedicated slot-0 pins (ESP-IDF sdmmc_pins.h
++ *      SDMMC_SLOT0_IOMUX_*), not board wiring — same on any P4 board.
++ *   4. LDO channel 4 set to 3.3 V for the microSD, via
++ *      PMU.ext_ldo[4] (PMU_EXT_LDO_P1_0P2A_REG @ PMU_BASE + 0x1d8).
++ *      Skip this and dw_mmc probes an empty slot: `rootwait` then hangs
++ *      forever with no error message.
++ *
++ * Plus the usual: PSRAM up, kernel at 0x48000000, this DTB at 0x48800000,
++ * a0 = hartid (0), a1 = DTB physical address, mstatus.MIE clear, fence.i.
++ * ---------------------------------------------------------------------
++ */
++/dts-v1/;
++
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/gpio/gpio.h>
++
++/ {
++	#address-cells = <1>;
++	#size-cells = <1>;
++	model = "Espressif ESP32-P4-Function-EV-Board";
++	compatible = "espressif,esp32p4-function-ev", "espressif,esp32p4";
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++		timebase-frequency = <16000000>;
++
++		CPU0: cpu@0 {
++			device_type = "cpu";
++			compatible = "riscv";
++			reg = <0>;
++			/*
++			 * The core really is RV32IMAFC, but CONFIG_FPU is off:
++			 * arch/riscv/Makefile appends "fd" (not "f") for
++			 * CONFIG_FPU, and arch/riscv/kernel/fpu.S saves state
++			 * with fsd — RV32D, which this core does not implement.
++			 * Declaring imafc here is harmless; nothing consumes it
++			 * to enable the FPU.
++			 */
++			riscv,isa = "rv32imafc";
++			mmu-type = "riscv,none";
++			status = "okay";
++
++			CPU0_intc: interrupt-controller {
++				#interrupt-cells = <1>;
++				compatible = "riscv,cpu-intc";
++				interrupt-controller;
++			};
++		};
++	};
++
++	memory@48000000 {
++		device_type = "memory";
++		reg = <0x48000000 0x02000000>; /* 32 MB PSRAM */
++	};
++
++	/*
++	 * XTAL fixed-rate clock at 40 MHz. The UART driver selects XTAL_CLK
++	 * in CLK_CONF and computes its divisor from this rate.
++	 */
++	xtal_clk: xtal-clk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <40000000>;
++		clock-output-names = "xtal";
++	};
++
++	aliases {
++		serial0 = &uart0;
++	};
++
++	chosen {
++		stdout-path = "serial0:4000000n8";
++		/*
++		 * CONFIG_CMDLINE_FORCE=y, so the kernel's built-in command
++		 * line wins and this string is never parsed. It is kept in
++		 * sync with config/kernel.config purely so the DTB is
++		 * self-describing; change both together or neither.
++		 */
++		bootargs = "earlycon console=ttyS0,4000000 root=/dev/mmcblk0p1 rootfstype=ext4 rootwait rw loglevel=8 idle=poll";
++	};
++
++	soc: soc {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		compatible = "simple-bus";
++		ranges;
++
++		/*
++		 * CLIC: Core-Local Interrupt Controller for the HP core.
++		 * 240 slots x 4 bytes. Slots 16-239 take peripheral sources
++		 * routed through the interrupt matrix.
++		 *
++		 * reg[0]: CLIC control registers
++		 * reg[1]: INTMTX HP core-0 base — the CLIC driver uses it to
++		 *         route peripheral sources onto slots.
++		 *
++		 * #interrupt-cells = 3: <clic_slot intmtx_source trigger>
++		 *   intmtx_source 0 means no routing (local interrupts).
++		 *
++		 * No interrupts-extended link to CPU0_intc: the CLIC<->hart
++		 * wiring is done in-driver (IRQCHIP_DECLARE, and riscv_intc
++		 * reads the active slot out of mcause), not through a DT
++		 * interrupt-parent chain. CPU0_intc therefore has no DT
++		 * consumers here, by design.
++		 *
++		 * Slot map used on this board:
++		 *   17 systimer   18 uart0   21 gpio bank0   22 sdmmc
++		 */
++		clic0: interrupt-controller@20801000 {
++			compatible = "espressif,esp32p4-clic";
++			reg = <0x20801000 0x3c0>,
++			      <0x500d6000 0x200>;
++			interrupt-controller;
++			#interrupt-cells = <3>;
++		};
++
++		/*
++		 * SYSTIMER: 52-bit counter at 16 MHz, alarm 0 -> INTMTX
++		 * source 53 -> CLIC slot 17.
++		 *
++		 * LEVEL_HIGH, not EDGE_RISING (why2025 patch 0022, folded in
++		 * here). target0 is a latched status bit: it asserts on match
++		 * and stays asserted until ST_INT_CLR, so level is the
++		 * self-healing fit. On an edge slot, a re-armed one-shot tick
++		 * that loses or coalesces a single edge dies permanently —
++		 * and every watchdog on the system is fed by that tick.
++		 */
++		systimer: timer@500e2000 {
++			compatible = "espressif,esp32p4-systimer";
++			reg = <0x500e2000 0x100>;
++			interrupts-extended = <&clic0 17 53 IRQ_TYPE_LEVEL_HIGH>;
++			status = "okay";
++		};
++
++		/*
++		 * UART0 — the console, and on a headless board the only way
++		 * to see anything at all.
++		 *
++		 * Configured 4000000 8N1 by the bootloader; INTMTX source 31
++		 * (ETS_UART0_INTR_SOURCE) -> CLIC slot 18. Level-triggered so
++		 * bytes arriving while the FIFO is still non-empty re-fire.
++		 *
++		 * DO NOT ADD `clock-frequency` HERE. It looks harmless and it
++		 * is not. drivers/tty/serial/earlycon.c:310 reads that
++		 * property into port->uartclk, and esp32_uart.c then does
++		 *
++		 *     if (device->port.uartclk != BASE_BAUD * 16)
++		 *             esp32_uart_set_baud(&device->port, device->baud);
++		 *
++		 * so a present clock-frequency makes earlycon REPROGRAM the
++		 * baud from the command-line string, fighting whatever the
++		 * bootloader set. With the property absent, uartclk stays 0,
++		 * earlycon.c:148 defaults it to BASE_BAUD * 16, the test is
++		 * false, and earlycon inherits the bootloader's baud — which
++		 * is what we want. The hypervisor DTS in the sibling repo does
++		 * carry clock-frequency on its 16550 node; do not copy that
++		 * habit across.
++		 *
++		 * `clocks` is different and is required: the full driver uses
++		 * it in set_termios to compute clkdiv for console=ttyS0,N.
++		 */
++		uart0: serial@500ca000 {
++			compatible = "esp,esp32p4-uart";
++			reg = <0x500ca000 0x1000>;
++			interrupts-extended = <&clic0 18 31 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&xtal_clk>;
++			status = "okay";
++		};
++
++		/*
++		 * TIMG0 main watchdog (MWDT0), stage 0 = system reset.
++		 * why2025 patch 0020, folded in here.
++		 *
++		 * Started at probe with WDOG_HW_RUNNING so the watchdog core
++		 * feeds it from boot until userspace opens /dev/watchdog: a
++		 * scheduler-killing wedge stops the feeds and the chip resets
++		 * within timeout-sec. This is also the only working `reboot`
++		 * path on this SoC — it registers the machine restart handler.
++		 *
++		 * Clocked from the 40 MHz XTAL with a fixed in-driver
++		 * prescaler; the MWDT module clock defaults to enabled on P4,
++		 * so no clocks handle is needed.
++		 *
++		 * Patch 0034 moves the arm to subsys_initcall, but freezes
++		 * before ~0.3 s are still uncovered — arming MWDT in the
++		 * bootloader is the open item there.
++		 */
++		wdt0: watchdog@500c2000 {
++			compatible = "espressif,esp32p4-wdt";
++			reg = <0x500c2000 0x100>;
++			timeout-sec = <30>;
++		};
++	};
++};
++
++/ {
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * Reserved pool for large NOMMU user-space mmap allocations
++		 * (why2025 patch 0010), routed through do_mmap_private.
++		 * 10 MB at the top of PSRAM: 0x49600000 + 0xa00000 lands
++		 * exactly on 0x4A000000, the end of the memory node.
++		 *
++		 * This backs mmap-anon only. Program text/data for a bFLT
++		 * exec still comes from the buddy allocator as ONE physically
++		 * contiguous block, and that path caps at MAX_PAGE_ORDER —
++		 * so if you start seeing
++		 *
++		 *   binfmt_flat: Unable to allocate RAM for process text/data
++		 *
++		 * on the bigger binaries (as is ~1.3 MB, objcopy ~0.9 MB),
++		 * shrinking this pool hands the difference back to buddy.
++		 * Keep the top edge pinned at 0x4A000000 if you resize it.
++		 */
++		app_pool: app-pool@49600000 {
++			compatible = "linux,nommu-userspace-pool";
++			reg = <0x49600000 0x00a00000>;
++		};
++	};
++
++	/*
++	 * On-chip LDO channel 4 powers the microSD slot. The bootloader sets
++	 * it to 3.3 V via PMU.ext_ldo[4] (PMU_EXT_LDO_P1_0P2A_REG @ +0x1d8);
++	 * modelled as an always-on fixed regulator until a real esp32p4-ldo
++	 * driver exists.
++	 */
++	sdmmc_vmmc: regulator-sdmmc-vmmc {
++		compatible = "regulator-fixed";
++		regulator-name = "sdmmc-vmmc";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	/*
++	 * biu/ciu stubs. These are not measurements — they are assertions
++	 * about what the bootloader programmed into HP_SYS_CLKRST
++	 * (PLL_F160M, host divider 4 -> 40 MHz). dw_mmc then picks
++	 * card_div = 1 for a 20 MHz card clock, inside the 25 MHz
++	 * default-speed cap set by max-frequency below.
++	 *
++	 * Change the divider in the bootloader without changing these and
++	 * the card clock is silently wrong.
++	 */
++	sdmmc_biu_clk: sdmmc-biu-clk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <40000000>;
++		clock-output-names = "sdmmc-biu";
++	};
++
++	sdmmc_ciu_clk: sdmmc-ciu-clk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <40000000>;
++		clock-output-names = "sdmmc-ciu";
++	};
++};
++
++&soc {
++	/*
++	 * GPIO / IO MUX. The P4 keeps both in one register block; the driver
++	 * models it as two banks (0 = GPIO 0..31, 1 = GPIO 32..63).
++	 *
++	 * Nothing in this DTS consumes a GPIO today — the badge's consumers
++	 * (panel reset, C6 reset, backlight, WS2812) are all gone. Kept
++	 * because it costs one CLIC slot and gives you card-detect and
++	 * general poking without a rebuild. See the sdmmc node for the
++	 * cd-gpios upgrade.
++	 */
++	gpio0: gpio@500e0000 {
++		compatible = "espressif,esp32p4-gpio";
++		reg = <0x500e0000 0x1000>;
++		espressif,bank-id = <0>;
++		gpio-controller;
++		#gpio-cells = <2>;
++		interrupt-controller;
++		#interrupt-cells = <2>;
++		interrupts-extended = <&clic0 21 74 IRQ_TYPE_LEVEL_HIGH>;
++		status = "okay";
++	};
++
++	gpio1: gpio-bank1@500e0000 {
++		compatible = "espressif,esp32p4-gpio";
++		reg = <0x500e0000 0x1000>;
++		espressif,bank-id = <1>;
++		gpio-controller;
++		#gpio-cells = <2>;
++		status = "okay";
++	};
++
++	/*
++	 * microSD — the root filesystem, and the only writable storage on
++	 * the board.
++	 *
++	 * The IP is byte-for-byte DesignWare DW MMC; the register map matches
++	 * mainline drivers/mmc/host/dw_mmc.h offsets exactly, so mainline
++	 * `snps,dw-mshc` drives it with no glue file. Patch 0007 is still
++	 * required: it restores multi-slot support and adds the cached-
++	 * descriptor-ring IDMAC fallback the P4's cache behaviour needs.
++	 *
++	 * dma-noncoherent is load-bearing — pair it with the riscv
++	 * non-standard cache ops from patch 0001.
++	 *
++	 * INTMTX source 23 (ETS_SDIO_HOST_INTR_SOURCE) -> CLIC slot 22,
++	 * level-high (RINTSTS is read-to-ack but the line stays asserted
++	 * until the status bits are cleared).
++	 *
++	 * broken-cd makes the mmc core poll for a card about once a second,
++	 * forever. If the EV board's CD line turns out to be wired to a GPIO,
++	 * replace it with cd-gpios = <&gpio0 N GPIO_ACTIVE_LOW> and the poll
++	 * goes away.
++	 *
++	 * fifo-depth is deliberately omitted: dw_mmc reads FIFOTH at probe.
++	 * Hardcoding it wrong is worse than letting the driver ask.
++	 */
++	sdmmc: mmc@50083000 {
++		compatible = "snps,dw-mshc";
++		reg = <0x50083000 0x1000>;
++		dma-noncoherent;
++
++		interrupts-extended = <&clic0 22 23 IRQ_TYPE_LEVEL_HIGH>;
++
++		clocks = <&sdmmc_biu_clk>, <&sdmmc_ciu_clk>;
++		clock-names = "biu", "ciu";
++
++		vmmc-supply = <&sdmmc_vmmc>;
++
++		bus-width = <4>;
++		broken-cd;
++		disable-wp;
++		max-frequency = <25000000>;
++
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		status = "okay";
++	};
++};

@@ -1,0 +1,734 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Espressif ESP32-P4-Function-EV-Board — native NOMMU Linux on the HP core
+ *
+ * Derived from the WHY2025 badge DTS (why2025-linux patch 0012) with every
+ * badge-only peripheral removed. What is left is chip-level and applies to
+ * any ESP32-P4 board that brings out UART0 and a microSD on slot 0.
+ *
+ *   SoC        ESP32-P4 rev v1.0 (hw_ver1 register layout)
+ *   HP core    RV32IMAFC at 360 MHz, M-mode, NOMMU, single core
+ *   RAM        32 MB HEX PSRAM at 0x48000000, 80 MHz
+ *   Flash      16 MB, DIO — carries the bootloader, kernel and this DTB only
+ *   Root       ext4 on microSD (dw_mmc slot 0), NOT flash
+ *   Console    UART0 at 0x500CA000, 4 Mbps
+ *   SYSTIMER   16 MHz free-running counter (XTAL 40 MHz / 2.5) = timebase
+ *
+ * Removed relative to the badge: MIPI-DSI host, ST7703 panel, backlight,
+ * ESP32-C6 over spi-gpio (esp-hosted Wi-Fi/BT), i2c-gpio bus with TCA8418
+ * keypad + BME680 + BMI270, WS2812B LEDs, and the `mtd-rom` flash@deadbeef
+ * rootfs window. That last one matters for the bootloader: with the rootfs
+ * on SD there is no placeholder `reg` to patch at runtime, so this DTB is a
+ * static blob the bootloader copies verbatim.
+ *
+ * Folded in from patches that used to edit the badge DTS, so those patches
+ * are dropped from the series:
+ *   0020  wdt0 node                                   (see watchdog@500c2000)
+ *   0022  systimer trigger EDGE_RISING -> LEVEL_HIGH  (see timer@500e2000)
+ *
+ * ---------------------------------------------------------------------
+ * WHAT THE BOOTLOADER MUST HAVE DONE BEFORE JUMPING HERE
+ *
+ * Linux has no ESP32-P4 clock, pinctrl or LDO driver, so several nodes
+ * below are deliberate fictions: fixed-clock stubs and always-on fixed
+ * regulators that describe state the bootloader is expected to have
+ * established. If any of these is not true, the matching driver does not
+ * fail loudly — it computes the wrong divisor or probes an unpowered
+ * device.
+ *
+ *   1. UART0 configured 4000000 8N1, SCLK = XTAL (40 MHz), clkdiv = 10.
+ *      40e6 / 4e6 is exactly 10, so no fractional divisor is involved —
+ *      unlike 115200, which needs 347 + 4/16.
+ *   2. SDMMC clocks in HP_SYS_CLKRST: source PLL_F160M, host divider 4,
+ *      giving the 40 MHz biu/ciu that sdmmc_{biu,ciu}_clk below claim.
+ *   3. SDMMC slot-0 IOMUX routed, function 0:
+ *         GPIO39=D0 GPIO40=D1 GPIO41=D2 GPIO42=D3 GPIO43=CLK GPIO44=CMD
+ *      These are the P4's dedicated slot-0 pins (ESP-IDF sdmmc_pins.h
+ *      SDMMC_SLOT0_IOMUX_*), not board wiring — same on any P4 board.
+ *   4. LDO channel 4 set to 3.3 V for the microSD, via
+ *      PMU.ext_ldo[4] (PMU_EXT_LDO_P1_0P2A_REG @ PMU_BASE + 0x1d8).
+ *      Skip this and dw_mmc probes an empty slot: `rootwait` then hangs
+ *      forever with no error message.
+ *
+ * Plus the usual: PSRAM up, kernel at 0x48000000, this DTB at 0x48800000,
+ * a0 = hartid (0), a1 = DTB physical address, mstatus.MIE clear, fence.i.
+ * ---------------------------------------------------------------------
+ */
+/dts-v1/;
+
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "Espressif ESP32-P4-Function-EV-Board";
+	compatible = "espressif,esp32p4-function-ev", "espressif,esp32p4";
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <16000000>;
+
+		CPU0: cpu@0 {
+			device_type = "cpu";
+			compatible = "riscv";
+			reg = <0>;
+			/*
+			 * The core really is RV32IMAFC, but CONFIG_FPU is off:
+			 * arch/riscv/Makefile appends "fd" (not "f") for
+			 * CONFIG_FPU, and arch/riscv/kernel/fpu.S saves state
+			 * with fsd — RV32D, which this core does not implement.
+			 * Declaring imafc here is harmless; nothing consumes it
+			 * to enable the FPU.
+			 */
+			riscv,isa = "rv32imafc";
+			mmu-type = "riscv,none";
+			status = "okay";
+
+			CPU0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				compatible = "riscv,cpu-intc";
+				interrupt-controller;
+			};
+		};
+	};
+
+	memory@48000000 {
+		device_type = "memory";
+		reg = <0x48000000 0x02000000>; /* 32 MB PSRAM */
+	};
+
+	/*
+	 * XTAL fixed-rate clock at 40 MHz. The UART driver selects XTAL_CLK
+	 * in CLK_CONF and computes its divisor from this rate.
+	 */
+	xtal_clk: xtal-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <40000000>;
+		clock-output-names = "xtal";
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:4000000n8";
+		/*
+		 * CONFIG_CMDLINE_FORCE=y, so the kernel's built-in command
+		 * line wins and this string is never parsed. It is kept in
+		 * sync with config/kernel.config purely so the DTB is
+		 * self-describing; change both together or neither.
+		 */
+		bootargs = "earlycon console=ttyS0,4000000 root=/dev/mmcblk0p1 rootfstype=ext4 rootwait rw loglevel=8";
+	};
+
+	soc: soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		/*
+		 * CLIC: Core-Local Interrupt Controller for the HP core.
+		 * 240 slots x 4 bytes. Slots 16-239 take peripheral sources
+		 * routed through the interrupt matrix.
+		 *
+		 * reg[0]: CLIC control registers
+		 * reg[1]: INTMTX HP core-0 base — the CLIC driver uses it to
+		 *         route peripheral sources onto slots.
+		 *
+		 * #interrupt-cells = 3: <clic_slot intmtx_source trigger>
+		 *   intmtx_source 0 means no routing (local interrupts).
+		 *
+		 * No interrupts-extended link to CPU0_intc: the CLIC<->hart
+		 * wiring is done in-driver (IRQCHIP_DECLARE, and riscv_intc
+		 * reads the active slot out of mcause), not through a DT
+		 * interrupt-parent chain. CPU0_intc therefore has no DT
+		 * consumers here, by design.
+		 *
+		 * Slot map used on this board:
+		 *   17 systimer   18 uart0   21 gpio bank0   22 sdmmc
+		 */
+		clic0: interrupt-controller@20801000 {
+			compatible = "espressif,esp32p4-clic";
+			reg = <0x20801000 0x3c0>,
+			      <0x500d6000 0x200>;
+			interrupt-controller;
+			#interrupt-cells = <3>;
+		};
+
+		/*
+		 * SYSTIMER: 52-bit counter at 16 MHz, alarm 0 -> INTMTX
+		 * source 53 -> CLIC slot 17.
+		 *
+		 * LEVEL_HIGH, not EDGE_RISING (why2025 patch 0022, folded in
+		 * here). target0 is a latched status bit: it asserts on match
+		 * and stays asserted until ST_INT_CLR, so level is the
+		 * self-healing fit. On an edge slot, a re-armed one-shot tick
+		 * that loses or coalesces a single edge dies permanently —
+		 * and every watchdog on the system is fed by that tick.
+		 */
+		systimer: timer@500e2000 {
+			compatible = "espressif,esp32p4-systimer";
+			reg = <0x500e2000 0x100>;
+			interrupts-extended = <&clic0 17 53 IRQ_TYPE_LEVEL_HIGH>;
+			status = "okay";
+		};
+
+		/*
+		 * UART0 — the console, and on a headless board the only way
+		 * to see anything at all.
+		 *
+		 * Configured 4000000 8N1 by the bootloader; INTMTX source 31
+		 * (ETS_UART0_INTR_SOURCE) -> CLIC slot 18. Level-triggered so
+		 * bytes arriving while the FIFO is still non-empty re-fire.
+		 *
+		 * DO NOT ADD `clock-frequency` HERE. It looks harmless and it
+		 * is not. drivers/tty/serial/earlycon.c:310 reads that
+		 * property into port->uartclk, and esp32_uart.c then does
+		 *
+		 *     if (device->port.uartclk != BASE_BAUD * 16)
+		 *             esp32_uart_set_baud(&device->port, device->baud);
+		 *
+		 * so a present clock-frequency makes earlycon REPROGRAM the
+		 * baud from the command-line string, fighting whatever the
+		 * bootloader set. With the property absent, uartclk stays 0,
+		 * earlycon.c:148 defaults it to BASE_BAUD * 16, the test is
+		 * false, and earlycon inherits the bootloader's baud — which
+		 * is what we want. The hypervisor DTS in the sibling repo does
+		 * carry clock-frequency on its 16550 node; do not copy that
+		 * habit across.
+		 *
+		 * `clocks` is different and is required: the full driver uses
+		 * it in set_termios to compute clkdiv for console=ttyS0,N.
+		 */
+		uart0: serial@500ca000 {
+			compatible = "esp,esp32p4-uart";
+			reg = <0x500ca000 0x1000>;
+			interrupts-extended = <&clic0 18 31 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&xtal_clk>;
+			status = "okay";
+		};
+
+		/*
+		 * TIMG0 main watchdog (MWDT0), stage 0 = system reset.
+		 * why2025 patch 0020, folded in here.
+		 *
+		 * Started at probe with WDOG_HW_RUNNING so the watchdog core
+		 * feeds it from boot until userspace opens /dev/watchdog: a
+		 * scheduler-killing wedge stops the feeds and the chip resets
+		 * within timeout-sec. This is also the only working `reboot`
+		 * path on this SoC — it registers the machine restart handler.
+		 *
+		 * Clocked from the 40 MHz XTAL with a fixed in-driver
+		 * prescaler; the MWDT module clock defaults to enabled on P4,
+		 * so no clocks handle is needed.
+		 *
+		 * Patch 0034 moves the arm to subsys_initcall, but freezes
+		 * before ~0.3 s are still uncovered — arming MWDT in the
+		 * bootloader is the open item there.
+		 *
+		 * timeout-sec was 30, and 30 was wrong. Nothing in this
+		 * rootfs opens /dev/watchdog — there is no busybox `watchdog`
+		 * applet built — so the feeds come from watchdog_core's
+		 * workqueue for the life of the system
+		 * (CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y). This board has one
+		 * usable core, so a long stretch of hard I/O starves that
+		 * workqueue, and `mkfs.ext2` on the 512 MiB partition reliably
+		 * took longer than 30 s and reset the board mid-format:
+		 *
+		 *   p4boot: reset reason 0x07 (MWDT (core))
+		 *
+		 * That is a false positive, and an expensive one — it looks
+		 * exactly like the driver hanging. 240 s still recovers a
+		 * genuinely wedged board in well under five minutes, which is
+		 * all this is for; the driver's max_timeout is 3600.
+		 *
+		 * The real fix is a userspace feeder (busybox CONFIG_WATCHDOG,
+		 * one line in board/busybox.fragment) so the timeout can go
+		 * back down and mean something. Until then, do not lower this
+		 * without checking how long a format takes.
+		 */
+		wdt0: watchdog@500c2000 {
+			compatible = "espressif,esp32p4-wdt";
+			reg = <0x500c2000 0x100>;
+			timeout-sec = <240>;
+		};
+	};
+};
+
+/ {
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Reserved pool for large NOMMU user-space mmap allocations
+		 * (why2025 patch 0010), routed through do_mmap_private.
+		 * 10 MB at the top of PSRAM: 0x49600000 + 0xa00000 lands
+		 * exactly on 0x4A000000, the end of the memory node.
+		 *
+		 * THIS BACKS bFLT PROGRAM TEXT/DATA, NOT JUST mmap-anon.
+		 * An earlier version of this comment claimed otherwise and it
+		 * cost an evening. Patch 0010 hooks do_mmap_private() in
+		 * mm/nommu.c, which is the allocator binfmt_flat uses for
+		 * every exec, and it tries the pool BEFORE buddy:
+		 *
+		 *   base = nommu_userspace_pool_alloc(point << PAGE_SHIFT);
+		 *   if (base) { ... } else
+		 *           base = alloc_pages_exact(...);
+		 *
+		 * So this number is the machine's capacity to run programs.
+		 * Shrinking it does not "hand memory back to buddy" in any
+		 * useful sense — it trades exec headroom for a bigger
+		 * MemTotal, and when it runs out you get
+		 *
+		 *   binfmt_flat: Unable to allocate RAM for process text/data
+		 *   nommu: Allocation of length 634880 from process N failed
+		 *
+		 * from buddy, which is too fragmented to honour 620 KB
+		 * contiguous on a machine this small. That is the failure the
+		 * pool exists to prevent.
+		 *
+		 * Sizing, measured rather than guessed: busybox needs 620 KB
+		 * per exec, `as` is 1.4 MB and `objcopy` 1.1 MB.
+		 *
+		 * BACK TO 10 MB, 2026-09-10. It was cut to 6 MB the day before
+		 * to make MemTotal look better, and that was the wrong trade.
+		 * 6 MB is enough for a login shell and a couple of commands
+		 * and runs out on anything real — an ordinary shell pipeline
+		 * with two command substitutions is five concurrent busybox
+		 * images, and once the pool is gone the buddy allocator has
+		 * to find 620 KB physically contiguous, which on this machine
+		 * it cannot:
+		 *
+		 *   nommu: Allocation of length 634880 from process 131 failed
+		 *   Normal: ... 6*512kB 0*1024kB 0*2048kB = 9248kB
+		 *
+		 * Nine megabytes free and not one block big enough. That is
+		 * the whole reason this pool exists, and it is worth 4 MB of
+		 * MemTotal to keep it working. The real memory win of the
+		 * previous day was never this — it was moving the root
+		 * filesystem off the initramfs, which is what freed 8 MB of
+		 * unevictable page cache.
+		 *
+		 * Keep the top edge pinned at 0x4A000000 if you resize it.
+		 *
+		 * CMA would give both properties at once — accounted *and*
+		 * contiguous — but `config CMA` depends on MMU, which is the
+		 * whole reason patch 0010 exists.
+		 */
+		app_pool: app-pool@49600000 {
+			compatible = "linux,nommu-userspace-pool";
+			reg = <0x49600000 0x00a00000>;
+		};
+
+	};
+
+	/*
+	 * On-chip LDO channel 4 powers the microSD slot. The bootloader sets
+	 * it to 3.3 V via PMU.ext_ldo[4] (PMU_EXT_LDO_P1_0P2A_REG @ +0x1d8);
+	 * modelled as an always-on fixed regulator until a real esp32p4-ldo
+	 * driver exists.
+	 */
+	sdmmc_vmmc: regulator-sdmmc-vmmc {
+		compatible = "regulator-fixed";
+		regulator-name = "sdmmc-vmmc";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * biu/ciu stubs. These are not measurements — they are assertions
+	 * about what the bootloader programmed into HP_SYS_CLKRST
+	 * (PLL_F160M, host divider 4 -> 40 MHz). dw_mmc then picks
+	 * card_div = 1 for a 20 MHz card clock, inside the 25 MHz
+	 * default-speed cap set by max-frequency below.
+	 *
+	 * Change the divider in the bootloader without changing these and
+	 * the card clock is silently wrong.
+	 */
+	sdmmc_biu_clk: sdmmc-biu-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <40000000>;
+		clock-output-names = "sdmmc-biu";
+	};
+
+	sdmmc_ciu_clk: sdmmc-ciu-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <40000000>;
+		clock-output-names = "sdmmc-ciu";
+	};
+};
+
+&soc {
+	/*
+	 * GPIO / IO MUX. The P4 keeps both in one register block; the driver
+	 * models it as two banks (0 = GPIO 0..31, 1 = GPIO 32..63).
+	 *
+	 * Nothing in this DTS consumes a GPIO today — the badge's consumers
+	 * (panel reset, C6 reset, backlight, WS2812) are all gone. Kept
+	 * because it costs one CLIC slot and gives you card-detect and
+	 * general poking without a rebuild. See the sdmmc node for the
+	 * cd-gpios upgrade.
+	 */
+	/*
+	 * BOTH BANKS ARE DISABLED, and this is why.
+	 *
+	 * esp32p4_gpio_driver_init() hangs. Not a fault -- no oops, no trap,
+	 * the console simply stops and ~30 s later the MWDT does its job and
+	 * resets the board. Captured on hardware 2026-09-08 with
+	 * initcall_debug:
+	 *
+	 *   calling  esp32p4_gpio_driver_init+0x0/0x12 @ 1
+	 *   gpio gpiochip0: Static allocation of GPIO base is deprecated...
+	 *   <nothing, ever>
+	 *
+	 * and the bootloader then reports reset reason 0x07, MWDT (core).
+	 * The probe prints and never returns.
+	 *
+	 * Disabling both banks is what got this board to a usable Linux: with
+	 * them off the boot runs straight through to mounting root. Nothing
+	 * here consumes a GPIO -- the badge's consumers were all removed, and
+	 * the sdmmc node polls with broken-cd rather than using cd-gpios -- so
+	 * nothing is lost today beyond card-detect and general pin poking.
+	 *
+	 * Suspicion, untested: bank 0 is the one with the irqchip, and bank 1
+	 * claims the SAME register window (0x500e0000) as bank 0. Either the
+	 * CLIC hookup or the second devm_ioremap of an already-claimed region
+	 * is a better first suspect than the gpiochip registration itself,
+	 * which had already printed by the time it wedged. Re-enable them one
+	 * at a time to find out -- bank 1 first, since it has no interrupt.
+	 */
+	gpio0: gpio@500e0000 {
+		compatible = "espressif,esp32p4-gpio";
+		reg = <0x500e0000 0x1000>;
+		espressif,bank-id = <0>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupts-extended = <&clic0 21 74 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	gpio1: gpio-bank1@500e0000 {
+		compatible = "espressif,esp32p4-gpio";
+		reg = <0x500e0000 0x1000>;
+		espressif,bank-id = <1>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		status = "disabled";
+	};
+
+	/*
+	 * microSD — the root filesystem, and the only writable storage on
+	 * the board.
+	 *
+	 * The IP is byte-for-byte DesignWare DW MMC; the register map matches
+	 * mainline drivers/mmc/host/dw_mmc.h offsets exactly, so mainline
+	 * `snps,dw-mshc` drives it with no glue file. Patch 0007 is still
+	 * required: it restores multi-slot support and adds the cached-
+	 * descriptor-ring IDMAC fallback the P4's cache behaviour needs.
+	 *
+	 * dma-noncoherent is load-bearing — pair it with the riscv
+	 * non-standard cache ops from patch 0001.
+	 *
+	 * INTMTX source 23 (ETS_SDIO_HOST_INTR_SOURCE) -> CLIC slot 22,
+	 * level-high (RINTSTS is read-to-ack but the line stays asserted
+	 * until the status bits are cleared).
+	 *
+	 * broken-cd makes the mmc core poll for a card about once a second,
+	 * forever. If the EV board's CD line turns out to be wired to a GPIO,
+	 * replace it with cd-gpios = <&gpio0 N GPIO_ACTIVE_LOW> and the poll
+	 * goes away.
+	 *
+	 * fifo-depth is deliberately omitted: dw_mmc reads FIFOTH at probe.
+	 * Hardcoding it wrong is worse than letting the driver ask.
+	 */
+	sdmmc: mmc@50083000 {
+		compatible = "snps,dw-mshc";
+		reg = <0x50083000 0x1000>;
+		dma-noncoherent;
+
+		interrupts-extended = <&clic0 22 23 IRQ_TYPE_LEVEL_HIGH>;
+
+		clocks = <&sdmmc_biu_clk>, <&sdmmc_ciu_clk>;
+		clock-names = "biu", "ciu";
+
+		vmmc-supply = <&sdmmc_vmmc>;
+
+		bus-width = <4>;
+		/*
+		 * non-removable, NOT broken-cd.
+		 *
+		 * broken-cd makes the mmc core poll for card presence roughly
+		 * once a second, forever. Every poll is an mmc request issued
+		 * alongside whatever filesystem I/O is in flight, and this card
+		 * is not going anywhere, so the poll buys nothing. Kept because
+		 * it is the right description of the board either way.
+		 *
+		 * It did NOT fix the SD root-mount hang, and neither did dropping
+		 * max-frequency to 4 MHz -- both were tried on hardware
+		 * 2026-09-08 and the mount wedged identically. See
+		 * docs/STATUS-2026-09-08.md; the cause is in the mmc/filesystem
+		 * path, not in these properties. max-frequency is back at the
+		 * value that has the most successful I/O behind it: mkfs and a
+		 * full 4.4 MB rootfs copy both completed at this setting.
+		 */
+		non-removable;
+		disable-wp;
+
+		/*
+		 * fifo-mode is deliberately NOT set, though patches/linux/0035
+		 * adds support for it. Forcing PIO was tried on hardware
+		 * 2026-09-08 to dodge the scatter-gather IDMAC hang and it made
+		 * things WORSE: with PIO the card enumerates but the partition
+		 * scan itself never completes -- the boot dies before even
+		 * printing "mmcblk0: p1 p2", where IDMAC at least gets a mounted
+		 * filesystem and a readable root directory.
+		 *
+		 * Add `fifo-mode;` here to reproduce that. See
+		 * docs/STATUS-2026-09-08.md for the full picture.
+		 */
+		max-frequency = <25000000>;
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		status = "okay";
+	};
+
+	/*
+	 * Ethernet.
+	 *
+	 * The ESP32-P4's EMAC is a Synopsys DesignWare GMAC, register for
+	 * register -- 0x00 MACCONFIGURATION, 0x10 GMIIADDRESS, 0x14 GMIIDATA,
+	 * 0x18 FLOWCONTROL, and ESP-IDF's own field name for the third of
+	 * those is `emacgmiiaddr`. So mainline stmmac drives it with no glue
+	 * file, exactly as mainline dw_mmc drives the SD controller.
+	 *
+	 * dwmac-3.70a is the compatible dwmac1000_core matches; the block
+	 * reports its own version in MACVERSION at 0x20, so if this turns out
+	 * to be wrong `devmem 0x50098020` says what it should be.
+	 *
+	 * INTMTX source 92 (ETS_ETH_MAC_INTR_SOURCE) -> CLIC slot 23, which
+	 * is the first free slot: 17 systimer, 18 uart0, 21 gpio bank0,
+	 * 22 sdmmc.
+	 *
+	 * dma-noncoherent, like the SD node, pairs with the riscv
+	 * non-standard cache ops from patch 0001.
+	 *
+	 * WHAT THE BOOTLOADER MUST HAVE DONE (p4/p4_emac.c)
+	 *   EMAC bus clock on, module reset pulsed, PHY_INTF_SEL = RMII,
+	 *   the RMII-input clock tree configured, the seven RMII pads on
+	 *   IOMUX function 3, MDC/MDIO routed through the GPIO matrix, and
+	 *   the PHY pulled out of reset on GPIO 51.
+	 */
+	/*
+	 * WHY TRANSMIT USED TO HANG, AND WHAT FIXED IT.
+	 *
+	 * Kept because the symptom was thoroughly misleading and the next
+	 * person to touch snps,force_thresh_dma_mode deserves to know what
+	 * happens without it.
+	 *
+	 * THE SYMPTOM. Link negotiated 100 Mbps full duplex, the PHY answered
+	 * MDIO, receive worked continuously -- and transmit stopped dead after
+	 * a handful of packets, with the netdev watchdog resetting the adapter
+	 * every five seconds:
+	 *
+	 *   eth0: NETDEV WATCHDOG: CPU: 0: transmit queue 0 timed out 5644 ms
+	 *   eth0: Reset adapter.
+	 *
+	 * Small frames went out fine. A DHCP DISCOVER never did, so the board
+	 * could receive the whole LAN's broadcast traffic and still never get
+	 * an address.
+	 *
+	 * WHAT IT WAS. The DMA parked in transmit state TS=3, "reading frame
+	 * data from host memory into the Tx FIFO", and stayed there forever --
+	 * no error bit, no underflow, no bus fault, just stopped mid-fetch:
+	 *
+	 *   DMASTATUS 0x00360000  TS=3       CURHOSTTXBUF 0x48d6a002
+	 *   tx_packets frozen     BQL inflight stuck at 342 (the DISCOVER)
+	 *
+	 * stmmac had turned on store-and-forward in both directions, because
+	 * dma_cap.tx_coe is set on this block and that alone is enough for
+	 * stmmac_dma_operation_mode() to choose SF. Store-and-forward means the
+	 * DMA pulls the entire frame into the FIFO before the MAC starts
+	 * sending -- and the FIFOs on this part are a few hundred bytes. ESP-IDF
+	 * says so itself, in a comment on the very same register
+	 * (emac_hal_init_dma_default):
+	 *
+	 *     Disable Receive Store Forward (Rx FIFO is only 256B)
+	 *
+	 * A 342-byte frame never fits, so the transfer never completes. 86-byte
+	 * frames fit, which is exactly why the failure looked size-dependent
+	 * and random rather than like a mode error.
+	 *
+	 * The four snps properties on the node put stmmac's DMA configuration
+	 * back where IDF has it. Threshold mode is the one that matters; the
+	 * other three are matched to IDF because that is the combination the
+	 * vendor validates.
+	 *
+	 * WHAT WAS NOT THE CAUSE, all measured on hardware through /dev/mem
+	 * (patch 0040) rather than reasoned about, and all worth not
+	 * re-investigating:
+	 *
+	 *   the DMA reaching PSRAM   TXDESCLISTADDR 0x48ae4000, the DMA walked
+	 *                            8 descriptors into it and fetched buffers
+	 *                            from it. It reads PSRAM fine.
+	 *   bus errors               no FBI, EB = 0, AHBORAXISTATUS = 0
+	 *   dropped frames           MISSEDFRAMECNT = 0
+	 *   the receive filter       MACFRAMEFILTER = 0
+	 *   the MAC being off        MACCONFIG = 0x0041cc0c, RE and TE set
+	 *   interrupts               DMA_INTEN = 0x0001a061; the count on
+	 *                            /proc/interrupts looked stuck at 1 only
+	 *                            because the awk was matching the wrong
+	 *                            line -- receive interrupts ran the whole
+	 *                            time
+	 *   the CLIC slot            23 and 19 behave identically
+	 *   the INTMTX source        92 is ETS_ETH_MAC_INTR_SOURCE, what IDF's
+	 *                            own driver allocates
+	 *
+	 * An earlier version of this comment claimed the EMAC's DMA cannot
+	 * reach PSRAM, inferred from IDF allocating buffers with
+	 * MALLOC_CAP_INTERNAL. That was wrong: soc_caps.h carries a blanket
+	 * SOC_PSRAM_DMA_CAPABLE for this chip, and the register dump above
+	 * shows the DMA using PSRAM addresses without complaint.
+	 */
+	emac: ethernet@50098000 {
+		compatible = "snps,dwmac-3.70a", "snps,dwmac";
+		reg = <0x50098000 0x2000>;
+
+		interrupts-extended = <&clic0 23 92 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "macirq";
+
+		clocks = <&emac_sys_clk>, <&emac_sys_clk>;
+		clock-names = "stmmaceth", "pclk";
+
+		phy-mode = "rmii";
+		phy-handle = <&ethphy>;
+		dma-noncoherent;
+
+		/*
+		 * The MDC divider, set explicitly rather than derived from the
+		 * clock rate, because the rate is not knowable from here.
+		 *
+		 * stmmac normally picks the divider from clk_get_rate() on
+		 * "stmmaceth". The EMAC's CSR clock on this part is SYS_CLK
+		 * (ESP-IDF: emac_ll_get_csr_clk_src -> SOC_MOD_CLK_SYS), and
+		 * SYS_CLK is cpu / mem_div / sys_div with both dividers set at
+		 * runtime -- so no honest fixed-clock value exists for it.
+		 *
+		 * 5 is STMMAC_CSR_250_300M, meaning CSR/124, and it is chosen
+		 * as the SAFE divider rather than the accurate one: MDC must
+		 * stay under 2.5 MHz, and /124 keeps it there for any SYS_CLK
+		 * up to ~310 MHz. A too-slow MDC costs nothing; a too-fast one
+		 * makes the PHY answer garbage or not at all.
+		 *
+		 * If the PHY is not detected, this is the first thing to
+		 * change -- stmmac's encoding is the hardware's, so 0=/42,
+		 * 1=/62, 2=/16, 3=/26, 4=/102, 5=/124.
+		 */
+		snps,clk-csr = <5>;
+
+		/*
+		 * DMA burst and FIFO mode, matched to ESP-IDF's own settings.
+		 *
+		 * These four are not tuning. They are the difference between
+		 * transmitting and hanging, and each one mirrors a line in
+		 * IDF's emac_hal_init_dma_default():
+		 *
+		 *   snps,force_thresh_dma_mode  -> TSF=0, RSF=0, threshold 64
+		 *   snps,aal                    -> AAL,  address-aligned beats
+		 *   snps,mixed-burst            -> MB,   let the DMA shorten a
+		 *                                        burst instead of
+		 *                                        forcing PBL every time
+		 *   snps,no-pbl-x8              -> PBL stays 8 beats, not 8x8
+		 *
+		 * The one that matters is the first. Left to itself stmmac
+		 * turns on store-and-forward in both directions, because
+		 * dma_cap.tx_coe is set on this block and that is enough for
+		 * stmmac_dma_operation_mode() to choose SF. Store-and-forward
+		 * means the DMA pulls the whole frame into the FIFO before the
+		 * MAC starts sending it -- and IDF's comment on the very same
+		 * register says why that cannot work here:
+		 *
+		 *     Disable Receive Store Forward (Rx FIFO is only 256B)
+		 *
+		 * The FIFOs on this part are a few hundred bytes. Anything
+		 * larger than that never fits, and the DMA simply stops with
+		 * the frame half-read. Threshold mode starts transmitting once
+		 * 64 bytes are in the FIFO and streams the rest, which is what
+		 * a FIFO this small requires.
+		 */
+		snps,pbl = <8>;
+		snps,no-pbl-x8;
+		snps,aal;
+		snps,mixed-burst;
+		snps,force_thresh_dma_mode;
+
+		status = "okay";
+
+		/*
+		 * The PHY has to be declared here, and leaving it out does
+		 * NOT fall back to scanning -- that was the first thing tried
+		 * and it cost a boot cycle to understand.
+		 *
+		 * With an `mdio` subnode present, stmmac_mdio_register() uses
+		 * of_mdiobus_register(), which instantiates exactly the PHYs
+		 * the device tree declares and scans for nothing. So
+		 * plat->phy_addr stays -1, and stmmac_init_phy() reports the
+		 * singularly unhelpful
+		 *
+		 *   stmmaceth 50098000.ethernet eth0: no phy found
+		 *
+		 * while the PHY is sitting there answering perfectly well.
+		 *
+		 * Address 1 and the identity come from the bootloader's own
+		 * MDIO scan (p4_emac_mdio_scan), which reads the ID registers
+		 * directly in M-mode:
+		 *
+		 *   p4boot: emac:   PHY at addr 1: id 0x02430c54, bmsr 0x7849,
+		 *           link down (CR5 = CSR/124)
+		 *
+		 * 0x02430c54 is an IC Plus IP101, which is what this board
+		 * fits; CONFIG_ICPLUS_PHY drives it. That scan also confirms
+		 * snps,clk-csr = <5> above, since CSR/124 is the divider it
+		 * got an answer with.
+		 */
+		mdio {
+			compatible = "snps,dwmac-mdio";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ethphy: ethernet-phy@1 {
+				reg = <1>;
+			};
+		};
+	};
+};
+
+/ {
+	/*
+	 * A stub for the EMAC's CSR clock. stmmac calls clk_get() on
+	 * "stmmaceth" and fails to probe without it, but the actual rate is
+	 * not used: snps,clk-csr above overrides the rate-derived divider.
+	 * The value is therefore deliberately a placeholder, and the node
+	 * exists to satisfy the binding rather than to describe hardware.
+	 */
+	emac_sys_clk: emac-sys-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <180000000>;
+		clock-output-names = "emac_sys_clk";
+	};
+};

@@ -1,0 +1,30 @@
+# Bootloader build output. `make` in bootloader/ regenerates all of it.
+*.o
+*.d
+*.map
+bootloader/bootloader.elf
+bootloader/bootloader.bin
+bootloader/partitions.bin
+
+# A dump of THIS board's factory flash, kept so `make restore` can put it
+# back. It is device-specific recovery data, not source, and yours will
+# differ -- make your own with `make backup` before you flash anything.
+bootloader/backup/
+
+# Built images: ~34 MB of kernel and root filesystem, all reproducible from
+# the sources here. See images/README.md for how to rebuild them, and
+# docs/BUILD.md for the full procedure.
+images/Image
+images/Image.*
+images/*.dtb
+images/*.tar
+images/*.ext2
+images/*.ext4
+images/*.cpio
+images/*.cpio.gz
+
+# Editor and OS noise
+*~
+*.swp
+.DS_Store
+Thumbs.db

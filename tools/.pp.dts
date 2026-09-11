@@ -1,0 +1,249 @@
+# 0 "dts/esp32p4-function-ev.dts"
+# 0 "<built-in>"
+# 0 "<command-line>"
+# 1 "dts/esp32p4-function-ev.dts"
+# 57 "dts/esp32p4-function-ev.dts"
+/dts-v1/;
+
+# 1 "C:/Users/LENOVO/Projects/esp32-p4-linux/tools/dt-include/dt-bindings/interrupt-controller/irq.h" 1
+# 60 "dts/esp32p4-function-ev.dts" 2
+# 1 "C:/Users/LENOVO/Projects/esp32-p4-linux/tools/dt-include/dt-bindings/gpio/gpio.h" 1
+# 61 "dts/esp32p4-function-ev.dts" 2
+
+/ {
+ #address-cells = <1>;
+ #size-cells = <1>;
+ model = "Espressif ESP32-P4-Function-EV-Board";
+ compatible = "espressif,esp32p4-function-ev", "espressif,esp32p4";
+
+ cpus {
+  #address-cells = <1>;
+  #size-cells = <0>;
+  timebase-frequency = <16000000>;
+
+  CPU0: cpu@0 {
+   device_type = "cpu";
+   compatible = "riscv";
+   reg = <0>;
+# 85 "dts/esp32p4-function-ev.dts"
+   riscv,isa = "rv32imafc";
+   mmu-type = "riscv,none";
+   status = "okay";
+
+   CPU0_intc: interrupt-controller {
+    #interrupt-cells = <1>;
+    compatible = "riscv,cpu-intc";
+    interrupt-controller;
+   };
+  };
+ };
+
+ memory@48000000 {
+  device_type = "memory";
+  reg = <0x48000000 0x02000000>;
+ };
+
+
+
+
+
+ xtal_clk: xtal-clk {
+  compatible = "fixed-clock";
+  #clock-cells = <0>;
+  clock-frequency = <40000000>;
+  clock-output-names = "xtal";
+ };
+
+ aliases {
+  serial0 = &uart0;
+ };
+
+ chosen {
+  stdout-path = "serial0:4000000n8";
+
+
+
+
+
+
+  bootargs = "earlycon console=ttyS0,4000000 root=/dev/mmcblk0p1 rootfstype=ext2 rootwait rw loglevel=8";
+ };
+
+ soc: soc {
+  #address-cells = <1>;
+  #size-cells = <1>;
+  compatible = "simple-bus";
+  ranges;
+# 155 "dts/esp32p4-function-ev.dts"
+  clic0: interrupt-controller@20801000 {
+   compatible = "espressif,esp32p4-clic";
+   reg = <0x20801000 0x3c0>,
+         <0x500d6000 0x200>;
+   interrupt-controller;
+   #interrupt-cells = <3>;
+  };
+# 174 "dts/esp32p4-function-ev.dts"
+  systimer: timer@500e2000 {
+   compatible = "espressif,esp32p4-systimer";
+   reg = <0x500e2000 0x100>;
+   interrupts-extended = <&clic0 17 53 4>;
+   status = "okay";
+  };
+# 208 "dts/esp32p4-function-ev.dts"
+  uart0: serial@500ca000 {
+   compatible = "esp,esp32p4-uart";
+   reg = <0x500ca000 0x1000>;
+   interrupts-extended = <&clic0 18 31 4>;
+   clocks = <&xtal_clk>;
+   status = "okay";
+  };
+# 255 "dts/esp32p4-function-ev.dts"
+  wdt0: watchdog@500c2000 {
+   compatible = "espressif,esp32p4-wdt";
+   reg = <0x500c2000 0x100>;
+   timeout-sec = <240>;
+  };
+ };
+};
+
+/ {
+ reserved-memory {
+  #address-cells = <1>;
+  #size-cells = <1>;
+  ranges;
+# 325 "dts/esp32p4-function-ev.dts"
+  app_pool: app-pool@49600000 {
+   compatible = "linux,nommu-userspace-pool";
+   reg = <0x49600000 0x00a00000>;
+  };
+
+ };
+
+
+
+
+
+
+
+ sdmmc_vmmc: regulator-sdmmc-vmmc {
+  compatible = "regulator-fixed";
+  regulator-name = "sdmmc-vmmc";
+  regulator-min-microvolt = <3300000>;
+  regulator-max-microvolt = <3300000>;
+  regulator-always-on;
+  regulator-boot-on;
+ };
+# 357 "dts/esp32p4-function-ev.dts"
+ sdmmc_biu_clk: sdmmc-biu-clk {
+  compatible = "fixed-clock";
+  #clock-cells = <0>;
+  clock-frequency = <40000000>;
+  clock-output-names = "sdmmc-biu";
+ };
+
+ sdmmc_ciu_clk: sdmmc-ciu-clk {
+  compatible = "fixed-clock";
+  #clock-cells = <0>;
+  clock-frequency = <40000000>;
+  clock-output-names = "sdmmc-ciu";
+ };
+};
+
+&soc {
+# 411 "dts/esp32p4-function-ev.dts"
+ gpio0: gpio@500e0000 {
+  compatible = "espressif,esp32p4-gpio";
+  reg = <0x500e0000 0x1000>;
+  espressif,bank-id = <0>;
+  gpio-controller;
+  #gpio-cells = <2>;
+  interrupt-controller;
+  #interrupt-cells = <2>;
+  interrupts-extended = <&clic0 21 74 4>;
+  status = "disabled";
+ };
+
+ gpio1: gpio-bank1@500e0000 {
+  compatible = "espressif,esp32p4-gpio";
+  reg = <0x500e0000 0x1000>;
+  espressif,bank-id = <1>;
+  gpio-controller;
+  #gpio-cells = <2>;
+  status = "disabled";
+ };
+# 457 "dts/esp32p4-function-ev.dts"
+ sdmmc: mmc@50083000 {
+  compatible = "snps,dw-mshc";
+  reg = <0x50083000 0x1000>;
+  dma-noncoherent;
+
+  interrupts-extended = <&clic0 22 23 4>;
+
+  clocks = <&sdmmc_biu_clk>, <&sdmmc_ciu_clk>;
+  clock-names = "biu", "ciu";
+
+  vmmc-supply = <&sdmmc_vmmc>;
+
+  bus-width = <4>;
+# 487 "dts/esp32p4-function-ev.dts"
+  non-removable;
+  disable-wp;
+# 502 "dts/esp32p4-function-ev.dts"
+  max-frequency = <25000000>;
+
+  #address-cells = <1>;
+  #size-cells = <0>;
+
+  status = "okay";
+ };
+# 598 "dts/esp32p4-function-ev.dts"
+ emac: ethernet@50098000 {
+  compatible = "snps,dwmac-3.70a", "snps,dwmac";
+  reg = <0x50098000 0x2000>;
+
+  interrupts-extended = <&clic0 23 92 4>;
+  interrupt-names = "macirq";
+
+  clocks = <&emac_sys_clk>, <&emac_sys_clk>;
+  clock-names = "stmmaceth", "pclk";
+
+  phy-mode = "rmii";
+  phy-handle = <&ethphy>;
+  dma-noncoherent;
+# 632 "dts/esp32p4-function-ev.dts"
+  snps,clk-csr = <5>;
+
+
+
+
+  snps,pbl = <8>;
+
+  status = "okay";
+# 668 "dts/esp32p4-function-ev.dts"
+  mdio {
+   compatible = "snps,dwmac-mdio";
+   #address-cells = <1>;
+   #size-cells = <0>;
+
+   ethphy: ethernet-phy@1 {
+    reg = <1>;
+   };
+  };
+ };
+};
+
+/ {
+
+
+
+
+
+
+
+ emac_sys_clk: emac-sys-clk {
+  compatible = "fixed-clock";
+  #clock-cells = <0>;
+  clock-frequency = <180000000>;
+  clock-output-names = "emac_sys_clk";
+ };
+};

@@ -1,0 +1,448 @@
+--- a/drivers/gpio/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/gpio/Kconfig	2026-05-05 11:14:25.080935369 +0200
+@@ -327,6 +327,19 @@
+ 	  and write pin state) for GPIO implemented in a number of GE single
+ 	  board computers.
+ 
++config GPIO_ESP32P4
++	tristate "Espressif ESP32-P4 GPIO"
++	depends on OF && (SOC_ESP32P4 || COMPILE_TEST)
++	select GPIO_GENERIC
++	select GPIOLIB_IRQCHIP
++	help
++	  Support for the GPIO controller on the Espressif ESP32-P4 SoC.
++	  Exposes the first 32 GPIOs through a gpio_chip; input-only or
++	  output direction control and level read/write. No interrupt
++	  support yet (use a per-pin sideband for now).
++
++	  Needed on the WHY2025 hacker badge for the ST7703 panel reset.
++
+ config GPIO_FTGPIO010
+ 	bool "Faraday FTGPIO010 GPIO"
+ 	depends on OF_GPIO
+--- a/drivers/gpio/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/gpio/Makefile	2026-05-05 11:14:25.081078411 +0200
+@@ -63,6 +63,7 @@
+ obj-$(CONFIG_GPIO_DS4520)		+= gpio-ds4520.o
+ obj-$(CONFIG_GPIO_DWAPB)		+= gpio-dwapb.o
+ obj-$(CONFIG_GPIO_EIC_SPRD)		+= gpio-eic-sprd.o
++obj-$(CONFIG_GPIO_ESP32P4)	+= gpio-esp32p4.o
+ obj-$(CONFIG_GPIO_ELKHARTLAKE)		+= gpio-elkhartlake.o
+ obj-$(CONFIG_GPIO_EM)			+= gpio-em.o
+ obj-$(CONFIG_GPIO_EN7523)		+= gpio-en7523.o
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/gpio/gpio-esp32p4.c	2026-05-05 11:14:25.122735372 +0200
+@@ -0,0 +1,413 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * GPIO controller driver for the Espressif ESP32-P4.
++ *
++ * The ESP32-P4 has 57 GPIOs (0..56) split across two banks:
++ *   bank 0 — GPIOs 0..31 (OUT/ENABLE/IN/STATUS at 0x04/0x20/0x3C/0x44)
++ *   bank 1 — GPIOs 32..56 (OUT1/ENABLE1/IN1/STATUS1 at 0x10/0x2C/0x40/0x50)
++ *
++ * Each DT node corresponds to one bank. The driver picks register offsets
++ * based on the `espressif,bank-id` property (0 or 1). Both DT nodes refer
++ * to the same MMIO page (0x500E0000 + 0x1000), so we use devm_ioremap (not
++ * devm_ioremap_resource) to allow the second probe to map an overlapping
++ * region.
++ *
++ * Per-pin INT_TYPE/INT_ENA registers (PIN<n>_REG at 0x74 + n*4) span both
++ * banks via `n` directly, so the IRQ chip ops accept hwirq numbers 0..31
++ * (relative to whichever bank this chip owns) and translate them via the
++ * driver-side `pin_offset` of the bank.
++ *
++ * IO MUX lives at 0x500E1000 (not in this MMIO window). Both banks map
++ * it independently (each bank's own devm_ioremap of the same physical
++ * page) and address into it using the global pin number (bank_id's
++ * pin_offset + chip-relative offset), so bank 0 and bank 1 always touch
++ * disjoint IO_MUX slots despite sharing the mapping.
++ *
++ * Bank 0 carries an irq_chip (handshake/data-ready inputs from the C6
++ * Wi-Fi co-processor). Bank 1 currently has no IRQ users — its DT node
++ * omits `interrupts`.
++ */
++
++#include <linux/gpio/driver.h>
++#include <linux/gpio/generic.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/irqchip/chained_irq.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/pinctrl/pinconf-generic.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++
++#define ESP32P4_GPIO_PIN_REG(n)		(0x74 + (n) * 0x4)
++#define ESP32P4_GPIO_PIN_INT_TYPE_MASK	(0x7u << 7)
++#define ESP32P4_GPIO_PIN_INT_TYPE_DIS	(0x0u << 7)
++#define ESP32P4_GPIO_PIN_INT_TYPE_POS	(0x1u << 7)
++#define ESP32P4_GPIO_PIN_INT_TYPE_NEG	(0x2u << 7)
++#define ESP32P4_GPIO_PIN_INT_TYPE_ANY	(0x3u << 7)
++#define ESP32P4_GPIO_PIN_INT_TYPE_LO	(0x4u << 7)
++#define ESP32P4_GPIO_PIN_INT_TYPE_HI	(0x5u << 7)
++#define ESP32P4_GPIO_PIN_INT_ENA_CPU	BIT(13)
++
++#define ESP32P4_GPIO_NGPIO		32 /* GPIOs per bank */
++#define ESP32P4_IO_MUX_NPINS		(ARRAY_SIZE(esp32p4_gpio_banks) * ESP32P4_GPIO_NGPIO)
++
++/*
++ * IO MUX lives in a separate MMIO region at 0x500E1000. GPIO_FUNCn_OUT_SEL_CFG
++ * (one register per GPIO, starting at offset 0x4) selects the function the
++ * pad listens to. MCU_SEL [14:12] = 1 routes the pad through the GPIO matrix
++ * (i.e. our OUT/ENABLE bits actually drive the pin). Reset default differs
++ * per pin: GPIO 12/13 default to MCU_SEL=1, but GPIO 17 defaults to 0
++ * (function 0 — likely a peripheral path), which silently drops our writes.
++ * IDF's gpio_config() always programs MCU_SEL=1; we have to do the same.
++ */
++#define ESP32P4_IO_MUX_BASE		0x500E1000
++#define ESP32P4_IO_MUX_PIN(n)		(0x4 + (n) * 0x4)
++#define IO_MUX_FUN_WPD			BIT(7)
++#define IO_MUX_FUN_WPU			BIT(8)
++#define IO_MUX_FUN_IE			BIT(9)
++#define IO_MUX_MCU_SEL_MASK		(0x7u << 12)
++#define IO_MUX_MCU_SEL_GPIO		(0x1u << 12)
++
++struct esp32p4_gpio_bank_regs {
++	u16 out_w1ts;
++	u16 out_w1tc;
++	u16 enable_w1ts;
++	u16 enable_w1tc;
++	u16 in;
++	u16 status;
++	u16 status_w1tc;
++	u8  pin_offset;	/* PIN_REG number for hwirq 0 of this bank */
++};
++
++static const struct esp32p4_gpio_bank_regs esp32p4_gpio_banks[] = {
++	[0] = { 0x08, 0x0C, 0x24, 0x28, 0x3C, 0x44, 0x4C,  0 },
++	[1] = { 0x14, 0x18, 0x30, 0x34, 0x40, 0x50, 0x58, 32 },
++};
++
++struct esp32p4_gpio {
++	struct gpio_generic_chip ggc;
++	void __iomem *base;
++	void __iomem *iomux;
++	raw_spinlock_t lock;		/* serializes RMW of PIN_REG[n] */
++	const struct esp32p4_gpio_bank_regs *regs;
++};
++
++/*
++ * IRQ chip ops.
++ *
++ * Per-pin config lives in GPIO_PIN<n>_REG: bits [9:7] choose trigger mode
++ * (0 disable, 1 posedge, 2 negedge, 3 anyedge, 4 lo-level, 5 hi-level),
++ * bit 13 enables delivery to the HP CPU. Pending bits read out of
++ * GPIO_STATUS_REG and are cleared write-1 to GPIO_STATUS_W1TC. The
++ * peripheral routes through INTMTX source 74 (ETS_GPIO_INTR0_SOURCE),
++ * which the CLIC binding maps onto a single platform IRQ in DT.
++ */
++static void esp32p4_gpio_irq_pin_rmw(struct esp32p4_gpio *gpio,
++				     unsigned int hwirq, u32 set, u32 clr)
++{
++	unsigned int pin = gpio->regs->pin_offset + hwirq;
++	void __iomem *reg = gpio->base + ESP32P4_GPIO_PIN_REG(pin);
++	unsigned long flags;
++	u32 val;
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++	val = readl(reg);
++	val = (val & ~clr) | set;
++	writel(val, reg);
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++}
++
++static void esp32p4_gpio_irq_mask(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct esp32p4_gpio *gpio = gpiochip_get_data(gc);
++
++	esp32p4_gpio_irq_pin_rmw(gpio, d->hwirq, 0, ESP32P4_GPIO_PIN_INT_ENA_CPU);
++	gpiochip_disable_irq(gc, d->hwirq);
++}
++
++static void esp32p4_gpio_irq_unmask(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct esp32p4_gpio *gpio = gpiochip_get_data(gc);
++
++	gpiochip_enable_irq(gc, d->hwirq);
++	esp32p4_gpio_irq_pin_rmw(gpio, d->hwirq, ESP32P4_GPIO_PIN_INT_ENA_CPU, 0);
++}
++
++static void esp32p4_gpio_irq_ack(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct esp32p4_gpio *gpio = gpiochip_get_data(gc);
++
++	writel(BIT(d->hwirq), gpio->base + gpio->regs->status_w1tc);
++}
++
++static int esp32p4_gpio_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct esp32p4_gpio *gpio = gpiochip_get_data(gc);
++	u32 mode;
++
++	switch (type & IRQ_TYPE_SENSE_MASK) {
++	case IRQ_TYPE_EDGE_RISING:
++		mode = ESP32P4_GPIO_PIN_INT_TYPE_POS;
++		break;
++	case IRQ_TYPE_EDGE_FALLING:
++		mode = ESP32P4_GPIO_PIN_INT_TYPE_NEG;
++		break;
++	case IRQ_TYPE_EDGE_BOTH:
++		mode = ESP32P4_GPIO_PIN_INT_TYPE_ANY;
++		break;
++	case IRQ_TYPE_LEVEL_HIGH:
++		mode = ESP32P4_GPIO_PIN_INT_TYPE_HI;
++		break;
++	case IRQ_TYPE_LEVEL_LOW:
++		mode = ESP32P4_GPIO_PIN_INT_TYPE_LO;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	esp32p4_gpio_irq_pin_rmw(gpio, d->hwirq, mode,
++				 ESP32P4_GPIO_PIN_INT_TYPE_MASK);
++
++	if (type & IRQ_TYPE_LEVEL_MASK)
++		irq_set_handler_locked(d, handle_level_irq);
++	else
++		irq_set_handler_locked(d, handle_edge_irq);
++
++	return 0;
++}
++
++static const struct irq_chip esp32p4_gpio_irq_chip = {
++	.name		= "esp32p4-gpio",
++	.irq_mask	= esp32p4_gpio_irq_mask,
++	.irq_unmask	= esp32p4_gpio_irq_unmask,
++	.irq_ack	= esp32p4_gpio_irq_ack,
++	.irq_set_type	= esp32p4_gpio_irq_set_type,
++	.flags		= IRQCHIP_IMMUTABLE,
++	GPIOCHIP_IRQ_RESOURCE_HELPERS,
++};
++
++static void esp32p4_gpio_irq_handler(struct irq_desc *desc)
++{
++	struct gpio_chip *gc = irq_desc_get_handler_data(desc);
++	struct esp32p4_gpio *gpio = gpiochip_get_data(gc);
++	struct irq_chip *parent_chip = irq_desc_get_chip(desc);
++	unsigned long pending;
++	unsigned int hwirq;
++
++	chained_irq_enter(parent_chip, desc);
++	pending = readl(gpio->base + gpio->regs->status);
++	for_each_set_bit(hwirq, &pending, ESP32P4_GPIO_NGPIO)
++		generic_handle_domain_irq(gc->irq.domain, hwirq);
++	chained_irq_exit(parent_chip, desc);
++}
++
++static int esp32p4_gpio_request(struct gpio_chip *gc, unsigned int offset)
++{
++	struct esp32p4_gpio *gpio = gpiochip_get_data(gc);
++	u32 val, prev;
++
++	if (!gpio->iomux)
++		return 0;
++
++	prev = readl(gpio->iomux + ESP32P4_IO_MUX_PIN(gpio->regs->pin_offset + offset));
++	val = (prev & ~IO_MUX_MCU_SEL_MASK) | IO_MUX_MCU_SEL_GPIO | IO_MUX_FUN_IE;
++	if (val != prev)
++		writel(val, gpio->iomux + ESP32P4_IO_MUX_PIN(gpio->regs->pin_offset + offset));
++
++	return 0;
++}
++
++/*
++ * Honor BIAS_PULL_UP / PULL_DOWN / DISABLE on requested pins. Wired up
++ * primarily for i2c-gpio (SDA/SCL on this board have no external
++ * pull-ups, so the badge firmware enables internal WPU). The pad's WPU
++ * is gated by output-disable in the silicon, so it has no effect when
++ * the pin is driven as output — safe to leave set after a request.
++ */
++static int esp32p4_gpio_set_config(struct gpio_chip *gc, unsigned int offset,
++				   unsigned long config)
++{
++	struct esp32p4_gpio *gpio = gpiochip_get_data(gc);
++	enum pin_config_param param = pinconf_to_config_param(config);
++	u32 val, prev;
++
++	if (!gpio->iomux)
++		return -ENOTSUPP;
++
++	prev = readl(gpio->iomux + ESP32P4_IO_MUX_PIN(gpio->regs->pin_offset + offset));
++	val = prev;
++
++	switch (param) {
++	case PIN_CONFIG_BIAS_PULL_UP:
++		val = (val & ~IO_MUX_FUN_WPD) | IO_MUX_FUN_WPU;
++		break;
++	case PIN_CONFIG_BIAS_PULL_DOWN:
++		val = (val & ~IO_MUX_FUN_WPU) | IO_MUX_FUN_WPD;
++		break;
++	case PIN_CONFIG_BIAS_DISABLE:
++		val &= ~(IO_MUX_FUN_WPU | IO_MUX_FUN_WPD);
++		break;
++	default:
++		return -ENOTSUPP;
++	}
++
++	if (val != prev)
++		writel(val, gpio->iomux + ESP32P4_IO_MUX_PIN(gpio->regs->pin_offset + offset));
++	return 0;
++}
++
++static int esp32p4_gpio_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct esp32p4_gpio *gpio;
++	struct resource *res;
++	u32 bank_id = 0;
++	int ret, irq;
++
++	gpio = devm_kzalloc(dev, sizeof(*gpio), GFP_KERNEL);
++	if (!gpio)
++		return -ENOMEM;
++
++	raw_spin_lock_init(&gpio->lock);
++
++	of_property_read_u32(dev->of_node, "espressif,bank-id", &bank_id);
++	if (bank_id >= ARRAY_SIZE(esp32p4_gpio_banks))
++		return dev_err_probe(dev, -EINVAL,
++				     "espressif,bank-id %u out of range\n", bank_id);
++	gpio->regs = &esp32p4_gpio_banks[bank_id];
++
++	/*
++	 * Both bank 0 and bank 1 register sets live in the same MMIO page,
++	 * so we use devm_ioremap (no exclusive request_mem_region) instead of
++	 * devm_ioremap_resource — otherwise the second probe would fail with
++	 * -EBUSY trying to claim an overlapping region.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return dev_err_probe(dev, -EINVAL, "missing reg resource\n");
++	gpio->base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!gpio->base)
++		return dev_err_probe(dev, -ENOMEM, "failed to map GPIO registers\n");
++
++	/*
++	 * IO MUX is a separate fixed region; not declared in DT, just map it.
++	 * Both bank probes map the same physical page independently (see the
++	 * file comment above), and each bank's .request/.set_config index
++	 * into it using the *global* pin number (pin_offset + offset), so
++	 * every instance needs the mapping to cover all banks' pins, not
++	 * just its own ESP32P4_GPIO_NGPIO worth.
++	 */
++	gpio->iomux = devm_ioremap(dev, ESP32P4_IO_MUX_BASE,
++				  ESP32P4_IO_MUX_PIN(ESP32P4_IO_MUX_NPINS - 1) + 4);
++	if (!gpio->iomux)
++		dev_warn(dev, "failed to map IO_MUX; pin function will not be configured per request\n");
++
++	/*
++	 * gpio_generic_chip_init consumes four register pointers:
++	 *   dat    — readable level (GPIO_IN for input, or GPIO_OUT for
++	 *            reading back driven output if dat==set)
++	 *   set    — write-1-to-set for output levels
++	 *   clr    — write-1-to-clear for output levels
++	 *   dirout — write-1-to-set for output enables
++	 *   dirin  — write-1-to-set for output disables (using the W1TC reg)
++	 *
++	 * GPIO_GENERIC_READ_OUTPUT_REG_SET is useful when we want reads to
++	 * report what we last drove on outputs (matches gpiolib expectations).
++	 * But we have a proper input register, so use that.
++	 */
++	struct gpio_generic_chip_config gcfg = {
++		.dev    = dev,
++		.sz     = 4,
++		.dat    = gpio->base + gpio->regs->in,
++		.set    = gpio->base + gpio->regs->out_w1ts,
++		.clr    = gpio->base + gpio->regs->out_w1tc,
++		.dirout = gpio->base + gpio->regs->enable_w1ts,
++		.dirin  = gpio->base + gpio->regs->enable_w1tc,
++		.flags  = 0,
++	};
++
++	ret = gpio_generic_chip_init(&gpio->ggc, &gcfg);
++	if (ret)
++		return dev_err_probe(dev, ret, "gpio_generic_chip_init failed\n");
++
++	gpio->ggc.gc.label = dev_name(dev);
++	gpio->ggc.gc.parent = dev;
++	gpio->ggc.gc.owner = THIS_MODULE;
++	/*
++	 * Pin the global gpio number to match the hardware pin number
++	 * (bank 0 → 0..31, bank 1 → 32..63). Legacy callers such as
++	 * esp_hosted-NG's `gpio_request(CONFIG_ESP_HOSTED_SPI_HANDSHAKE_GPIO)`
++	 * pass hardware pin numbers; auto-allocated bases (gc.base=-1) put
++	 * the chip somewhere up near ARCH_NR_GPIOS and break that mapping.
++	 */
++	gpio->ggc.gc.base = bank_id * ESP32P4_GPIO_NGPIO;
++	gpio->ggc.gc.ngpio = ESP32P4_GPIO_NGPIO;
++	gpio->ggc.gc.request = esp32p4_gpio_request;
++	gpio->ggc.gc.set_config = esp32p4_gpio_set_config;
++
++	/*
++	 * Wire up the irq_chip if DT gave us a parent IRQ. Optional: nodes
++	 * like the panel-reset GPIO 17 don't need IRQs, so a missing
++	 * `interrupts` property is not a probe failure — the chip just
++	 * remains output-/poll-only.
++	 */
++	irq = platform_get_irq_optional(pdev, 0);
++	if (irq > 0) {
++		struct gpio_irq_chip *girq = &gpio->ggc.gc.irq;
++
++		/*
++		 * Mask + ack every line up front so the kernel never sees a
++		 * stale latch from before we owned the controller.
++		 */
++		writel(~0u, gpio->base + gpio->regs->status_w1tc);
++
++		gpio_irq_chip_set_chip(girq, &esp32p4_gpio_irq_chip);
++		girq->parent_handler = esp32p4_gpio_irq_handler;
++		girq->num_parents = 1;
++		girq->parents = devm_kcalloc(dev, 1, sizeof(*girq->parents),
++					     GFP_KERNEL);
++		if (!girq->parents)
++			return -ENOMEM;
++		girq->parents[0] = irq;
++		girq->default_type = IRQ_TYPE_NONE;
++		girq->handler = handle_bad_irq;
++	} else if (irq != -ENXIO) {
++		return dev_err_probe(dev, irq, "platform_get_irq_optional\n");
++	}
++
++	ret = devm_gpiochip_add_data(dev, &gpio->ggc.gc, gpio);
++	if (ret)
++		return dev_err_probe(dev, ret, "gpiochip_add failed\n");
++
++	dev_info(dev, "esp32p4-gpio: %u GPIOs (bank %u, hw %u..%u) at %p%s\n",
++		 ESP32P4_GPIO_NGPIO, bank_id,
++		 gpio->regs->pin_offset, gpio->regs->pin_offset + ESP32P4_GPIO_NGPIO - 1,
++		 gpio->base,
++		 irq > 0 ? ", irq enabled" : "");
++	return 0;
++}
++
++static const struct of_device_id esp32p4_gpio_of_match[] = {
++	{ .compatible = "espressif,esp32p4-gpio" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, esp32p4_gpio_of_match);
++
++static struct platform_driver esp32p4_gpio_driver = {
++	.probe	= esp32p4_gpio_probe,
++	.driver	= {
++		.name		= "esp32p4-gpio",
++		.of_match_table	= esp32p4_gpio_of_match,
++	},
++};
++module_platform_driver(esp32p4_gpio_driver);
++
++MODULE_AUTHOR("WHY2025 Linux port");
++MODULE_DESCRIPTION("Espressif ESP32-P4 GPIO controller");
++MODULE_LICENSE("GPL");

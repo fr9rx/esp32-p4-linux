@@ -1,0 +1,47 @@
+mmc: dw_mmc: add a "fifo-mode" DT property to force PIO
+
+Adds an opt-in device-tree property that takes the driver's existing
+no_dma path, so a board can disable IDMAC without a code change.
+
+Written while chasing an SD failure on the ESP32-P4, where scatter-gather
+IDMAC transfers hang the controller. Single large contiguous requests are
+fine -- dd of a whole megabyte to or from the raw block device works every
+time -- but the multi-descriptor transfers a filesystem generates wedge it,
+reproducibly: an ext2 root directory lists, a file in that directory reads
+back correctly, and reading ANY subdirectory never returns, after which the
+board's watchdog resets it.
+
+NOTE: forcing PIO did NOT fix that, and made it worse -- with PIO the card
+enumerates but the partition scan never completes. The property is kept
+because it is a useful one-line toggle for anyone investigating further,
+and it is inert unless the DT asks for it. The ESP32-P4 DTS does not.
+
+Not upstream.
+
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -3130,6 +3130,24 @@
+ 	struct device *dev = host->dev;
+ 
+ 	/*
++	 * "fifo-mode" in the device tree forces PIO, bypassing IDMAC.
++	 *
++	 * Added for the ESP32-P4, where scatter-gather IDMAC transfers hang
++	 * the controller. Single large contiguous requests are fine -- dd of
++	 * a whole megabyte to or from the raw block device works every time --
++	 * but the multi-descriptor transfers a filesystem generates wedge it,
++	 * reproducibly: an ext2 root directory lists, a file in it reads back
++	 * correctly, and reading any subdirectory never returns. The MWDT then
++	 * resets the board.
++	 *
++	 * PIO costs throughput and buys a working card.
++	 */
++	if (device_property_read_bool(dev, "fifo-mode")) {
++		dev_info(host->dev, "fifo-mode in DT: forcing PIO\n");
++		goto no_dma;
++	}
++
++	/*
+ 	* Check tansfer mode from HCON[17:16]
+ 	* Clear the ambiguous description of dw_mmc databook:
+ 	* 2b'00: No DMA Interface -> Actually means using Internal DMA block

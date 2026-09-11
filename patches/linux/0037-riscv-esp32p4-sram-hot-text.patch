@@ -1,0 +1,328 @@
+riscv: esp32p4: run hot kernel text from internal SRAM
+
+The kernel executes from 32 MB of external HEX PSRAM behind the L1/L2 cache.
+A hit is cheap; a miss is an MSPI round trip. The code most likely to be found
+missing is exactly the code on the interrupt, timekeeping and DMA paths --
+short functions that run constantly but with enough other work between calls
+to have been evicted.
+
+The chip has 768 KB of internal SRAM that the kernel currently does not use at
+all. Give it a use: collect functions marked __sramtext into a .sram.text
+section linked into that SRAM, and copy the section there from the kernel
+image in _start_kernel, before anything can call into it.
+
+The section has two addresses on purpose. Its VMA is the SRAM window, because
+that is where the code runs and where every pointer to it must resolve. Its
+LMA is the next byte of the kernel image, so Image stays one contiguous blob
+-- objcopy -O binary orders sections by LMA, and a VMA-shaped hole would
+produce a 128 MB file. The bootloader needs to know nothing about any of this.
+
+Address choice, from ESP-IDF's esp_system/ld/esp32p4/memory.ld.in: 0x4FF40000
+is the start of what IDF calls sram_high. It is above every ROM-reserved range
+-- ROM download buffers, ROM startup stacks and ROM .bss/.data all end at
+0x4FF40000 on rev <= ECO4 -- and below the L2 cache, which is carved out of
+the top of the same 768 KB. With CONFIG_CACHE_L2_CACHE_SIZE at its 128 KB
+default that leaves 0x4FF40000..0x4FFA0000, so 384 KB. The default budget here
+is 128 KB of it, and the link fails rather than overrunning into the cache.
+
+REQUIRES !RELOCATABLE, AND THAT IS NOT PACKAGING
+
+A relocatable NOMMU kernel is linked at 0 and self-relocates to wherever it
+was loaded, adding a fixed bias to every absolute address it finds.
+.sram.text must not move with the image -- it has a real fixed home in the
+memory map -- so the two schemes cannot both be right, and the Kconfig entry
+says so with a depends on. Set CONFIG_PHYS_RAM_BASE to the load address and
+turn RELOCATABLE off; arch/riscv/include/asm/pgtable.h then links NOMMU
+absolutely at that base.
+
+Marked in this patch, all small leaf functions on the hottest paths: the CLIC
+mask/unmask/ack, the systimer clocksource and sched_clock reads, and the three
+ROM-thunk DMA cache maintenance hooks that run on every dma_map/unmap.
+
+Default n. Enabling it is a measurement, not an assumption: hot code that
+stays resident in L1 gains little, and the honest place to look for the win is
+interrupt latency and I/O throughput.
+
+Signed-off-by: f23 <ali@connectedmotion.io>
+diff -urN a/arch/riscv/Kconfig.socs b/arch/riscv/Kconfig.socs
+--- a/arch/riscv/Kconfig.socs	2026-09-05 20:46:00.861048170 +0300
++++ b/arch/riscv/Kconfig.socs	2026-09-09 23:56:39.851008641 +0300
+@@ -114,4 +114,53 @@
+ 	  The ESP32-P4 features dual RV32IMAFC HP cores, LP core,
+ 	  and 32MB HEX PSRAM.
+ 
++config ESP32P4_SRAM_TEXT
++	bool "Run hot kernel text from internal SRAM"
++	depends on SOC_ESP32P4 && !RELOCATABLE
++	default n
++	help
++	  The kernel runs from 32 MB of external HEX PSRAM reached through
++	  the L1/L2 cache. A hit costs about what SRAM costs; a miss costs
++	  an MSPI round trip. Code on the interrupt and DMA paths is exactly
++	  what tends to miss, because it runs after other work has evicted
++	  it.
++
++	  Saying Y here collects functions marked __sramtext into a
++	  .sram.text section linked at CONFIG_ESP32P4_SRAM_TEXT_BASE, in the
++	  chip's 768 KB of internal SRAM, and copies it there from the kernel
++	  image in _start_kernel before anything can call into it.
++
++	  This requires !RELOCATABLE, and that is not a packaging detail. A
++	  relocatable NOMMU kernel is linked at 0 and self-relocates to
++	  wherever it was loaded, adding a fixed bias to every absolute
++	  address. .sram.text must NOT move with the rest of the image -- it
++	  has a real, fixed home in the memory map -- so the two schemes
++	  cannot both be right. Set CONFIG_PHYS_RAM_BASE to the load address
++	  and turn RELOCATABLE off.
++
++config ESP32P4_SRAM_TEXT_BASE
++	hex "Internal SRAM window for hot kernel text"
++	depends on ESP32P4_SRAM_TEXT
++	default 0x4ff40000
++	help
++	  Where .sram.text is linked. The default is the start of the region
++	  ESP-IDF calls sram_high (esp_system/ld/esp32p4/memory.ld.in):
++	  0x4FF40000 is above every ROM-reserved area -- ROM download
++	  buffers, ROM startup stacks and ROM .bss/.data all end at
++	  0x4FF40000 on rev <= ECO4 silicon -- and below the L2 cache, which
++	  is carved out of the top of the same 768 KB window. With a 128 KB
++	  L2 cache that leaves 0x4FF40000..0x4FFA0000, or 384 KB.
++
++	  Do not lower this to reclaim the 164 KB the second-stage
++	  bootloader occupies at 0x4FF00000 without re-reading those ROM
++	  ranges: they sit between the two.
++
++config ESP32P4_SRAM_TEXT_SIZE
++	hex "Size of the SRAM text window"
++	depends on ESP32P4_SRAM_TEXT
++	default 0x20000
++	help
++	  Budget for .sram.text. The link fails if the section outgrows it,
++	  rather than silently overrunning into the L2 cache.
++
+ endmenu # "SoC selection"
+diff -urN a/arch/riscv/include/asm/sram.h b/arch/riscv/include/asm/sram.h
+--- a/arch/riscv/include/asm/sram.h	1970-01-01 02:00:00.000000000 +0200
++++ b/arch/riscv/include/asm/sram.h	2026-09-09 23:56:39.859008640 +0300
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Hot kernel text in ESP32-P4 internal SRAM.
++ *
++ * Mark a function __sramtext and it is linked into .sram.text, which lives in
++ * internal SRAM rather than in the cached PSRAM window the rest of the kernel
++ * runs from. _start_kernel copies the section into place before the first
++ * call can reach it; see arch/riscv/kernel/head.S.
++ *
++ * WHAT TO MARK
++ *
++ * Small leaf functions on paths that run often and are likely to have been
++ * evicted by the time they run again: interrupt mask/ack, the clocksource
++ * read, the DMA cache maintenance hooks. The window is a budget
++ * (CONFIG_ESP32P4_SRAM_TEXT_SIZE), so this is not somewhere to move large
++ * subsystems.
++ *
++ * WHAT NOT TO MARK
++ *
++ * Anything that runs before the copy in _start_kernel -- which means anything
++ * reachable from head.S ahead of that point, including the .bss clear.
++ *
++ * noinline and __noclone are part of the contract, not decoration. Without
++ * them the compiler is free to inline or clone the function into a caller
++ * that lives in .text, and the attribute silently buys nothing.
++ */
++#ifndef _ASM_RISCV_SRAM_H
++#define _ASM_RISCV_SRAM_H
++
++#ifdef CONFIG_ESP32P4_SRAM_TEXT
++#define __sramtext	noinline __noclone __section(".sram.text")
++#else
++#define __sramtext
++#endif
++
++#endif /* _ASM_RISCV_SRAM_H */
+diff -urN a/arch/riscv/kernel/head.S b/arch/riscv/kernel/head.S
+--- a/arch/riscv/kernel/head.S	2026-09-05 20:46:01.089048131 +0300
++++ b/arch/riscv/kernel/head.S	2026-09-09 23:56:39.863008638 +0300
+@@ -348,6 +348,35 @@
+ 	call kasan_early_init
+ #endif
+ 	/* Start the kernel */
++#ifdef CONFIG_ESP32P4_SRAM_TEXT
++	/*
++	 * Copy .sram.text from the image into internal SRAM.
++	 *
++	 * Open-coded rather than a memcpy() call: memcpy is a candidate for
++	 * living in .sram.text itself, and calling it to populate its own
++	 * home would be a fine way to spend an afternoon. .bss is already
++	 * clear at this point and nothing marked __sramtext has run.
++	 *
++	 * Word-at-a-time is safe -- the linker script aligns both ends to 8.
++	 * fence.i afterwards because these are instructions we just wrote
++	 * through the data path; internal SRAM is not cached on this SoC, so
++	 * no data-cache writeback is needed with it.
++	 */
++	la	a3, __sram_text_lma
++	la	a4, __sram_text_start
++	la	a5, __sram_text_end
++	beq	a4, a5, .Lsram_text_done
++.Lsram_text_copy:
++	lw	a6, 0(a3)
++	sw	a6, 0(a4)
++	addi	a3, a3, 4
++	addi	a4, a4, 4
++	bltu	a4, a5, .Lsram_text_copy
++.Lsram_text_done:
++	fence	w, r
++	fence.i
++#endif
++
+ 	call soc_early_init
+ 	tail start_kernel
+ 
+diff -urN a/arch/riscv/kernel/vmlinux.lds.S b/arch/riscv/kernel/vmlinux.lds.S
+--- a/arch/riscv/kernel/vmlinux.lds.S	2026-06-09 13:28:53.000000000 +0300
++++ b/arch/riscv/kernel/vmlinux.lds.S	2026-09-09 23:56:39.871008636 +0300
+@@ -48,6 +48,43 @@
+ 		_etext = .;
+ 	}
+ 
++#ifdef CONFIG_ESP32P4_SRAM_TEXT
++	/*
++	 * Hot text, executed from internal SRAM.
++	 *
++	 * Two addresses, deliberately different. The VMA is the SRAM window,
++	 * because that is where this code runs and where every pointer to it
++	 * has to resolve. The LMA is the next byte of the kernel image, so
++	 * `Image` stays one contiguous blob that a bootloader can copy to
++	 * PSRAM without knowing this section exists -- objcopy -O binary lays
++	 * sections out by LMA, and a VMA-shaped hole here would produce a
++	 * 128 MB file.
++	 *
++	 * The `- LOAD_OFFSET` on the AT() is not decoration. Every other
++	 * section here sets its LMA with AT(ADDR(x) - LOAD_OFFSET), so the
++	 * image's LMA space is based at 0 while VMAs are based at
++	 * CONFIG_PHYS_RAM_BASE. Handing AT() a VMA-space value instead puts
++	 * this section's LMA 0x48000000 above the rest, and objcopy dutifully
++	 * zero-fills the gap: a 1.2 GB Image from a 424-byte section.
++	 *
++	 * The assignment afterwards puts the location counter back where the
++	 * LMA left it. Without it every later section would be linked from
++	 * inside the SRAM window.
++	 */
++	. = ALIGN(8);
++	__sram_text_lma = .;
++	.sram.text CONFIG_ESP32P4_SRAM_TEXT_BASE : AT(__sram_text_lma - LOAD_OFFSET) {
++		__sram_text_start = .;
++		*(.sram.text .sram.text.*)
++		. = ALIGN(8);
++		__sram_text_end = .;
++	}
++	. = __sram_text_lma + SIZEOF(.sram.text);
++
++	ASSERT(SIZEOF(.sram.text) <= CONFIG_ESP32P4_SRAM_TEXT_SIZE,
++	       ".sram.text is larger than CONFIG_ESP32P4_SRAM_TEXT_SIZE")
++#endif
++
+ 	. = ALIGN(SECTION_ALIGN);
+ 	__init_begin = .;
+ 	__init_text_begin = .;
+diff -urN a/drivers/cache/esp32p4_cache.c b/drivers/cache/esp32p4_cache.c
+--- a/drivers/cache/esp32p4_cache.c	2026-09-05 20:46:01.785048036 +0300
++++ b/drivers/cache/esp32p4_cache.c	2026-09-09 23:56:39.875008636 +0300
+@@ -23,6 +23,7 @@
+ #include <linux/types.h>
+ #include <asm/cacheflush.h>
+ #include <asm/dma-noncoherent.h>
++#include <asm/sram.h>
+ 
+ #define ESP32P4_CACHE_MAP_L1D	0x10
+ #define ESP32P4_CACHE_MAP_L2	0x20
+@@ -42,7 +43,7 @@
+  * Invalidates run outer-to-inner (L2 before L1D) so a refill between
+  * the two ops cannot repopulate L1 from a still-stale L2 line.
+  */
+-static void esp32p4_dma_cache_wback(phys_addr_t paddr, size_t size)
++static void __sramtext esp32p4_dma_cache_wback(phys_addr_t paddr, size_t size)
+ {
+ 	unsigned long flags;
+ 
+@@ -52,7 +53,7 @@
+ 	local_irq_restore(flags);
+ }
+ 
+-static void esp32p4_dma_cache_inv(phys_addr_t paddr, size_t size)
++static void __sramtext esp32p4_dma_cache_inv(phys_addr_t paddr, size_t size)
+ {
+ 	unsigned long flags;
+ 
+@@ -62,7 +63,7 @@
+ 	local_irq_restore(flags);
+ }
+ 
+-static void esp32p4_dma_cache_wback_inv(phys_addr_t paddr, size_t size)
++static void __sramtext esp32p4_dma_cache_wback_inv(phys_addr_t paddr, size_t size)
+ {
+ 	unsigned long flags;
+ 
+diff -urN a/drivers/clocksource/timer-esp32p4-systimer.c b/drivers/clocksource/timer-esp32p4-systimer.c
+--- a/drivers/clocksource/timer-esp32p4-systimer.c	2026-09-05 20:46:01.893048020 +0300
++++ b/drivers/clocksource/timer-esp32p4-systimer.c	2026-09-09 23:56:39.883008634 +0300
+@@ -21,6 +21,7 @@
+ #include <linux/of_irq.h>
+ #include <linux/sched_clock.h>
+ #include <asm/delay.h>		/* riscv_timebase */
++#include <asm/sram.h>
+ 
+ /* SYSTIMER register byte offsets (struct size = 0x100) */
+ #define ST_CONF          0x00   /* clk_en[31], unit0_work_en[30], target0_work_en[24] */
+@@ -78,7 +79,7 @@
+ /*  Counter read (52-bit, 16 MHz)                                      */
+ /* ------------------------------------------------------------------ */
+ 
+-static u64 notrace esp32p4_systimer_read64(void)
++static u64 notrace __sramtext esp32p4_systimer_read64(void)
+ {
+ 	u32 hi, hi2, lo;
+ 
+@@ -108,7 +109,7 @@
+ 	return ((u64)hi << 32) | lo;
+ }
+ 
+-static u64 esp32p4_cs_read(struct clocksource *cs)
++static u64 __sramtext esp32p4_cs_read(struct clocksource *cs)
+ {
+ 	return esp32p4_systimer_read64();
+ }
+diff -urN a/drivers/irqchip/irq-esp32p4-clic.c b/drivers/irqchip/irq-esp32p4-clic.c
+--- a/drivers/irqchip/irq-esp32p4-clic.c	2026-09-05 20:46:01.361048098 +0300
++++ b/drivers/irqchip/irq-esp32p4-clic.c	2026-09-09 23:56:39.887008633 +0300
+@@ -24,6 +24,7 @@
+ #include <linux/io.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
++#include <asm/sram.h>
+ 
+ #define CLIC_NUM_IRQS     240
+ #define CLIC_INTIP_OFF      0
+@@ -44,17 +45,17 @@
+ struct irq_domain *esp32p4_clic_domain;
+ EXPORT_SYMBOL_GPL(esp32p4_clic_domain);
+ 
+-static void clic_irq_mask(struct irq_data *d)
++static void __sramtext clic_irq_mask(struct irq_data *d)
+ {
+ 	writeb(0, clic_base + d->hwirq * 4 + CLIC_INTIE_OFF);
+ }
+ 
+-static void clic_irq_unmask(struct irq_data *d)
++static void __sramtext clic_irq_unmask(struct irq_data *d)
+ {
+ 	writeb(1, clic_base + d->hwirq * 4 + CLIC_INTIE_OFF);
+ }
+ 
+-static void clic_irq_ack(struct irq_data *d)
++static void __sramtext clic_irq_ack(struct irq_data *d)
+ {
+ 	/*
+ 	 * Per CLIC spec, INTIP on a level-triggered slot mirrors the source

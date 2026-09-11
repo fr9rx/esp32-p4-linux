@@ -1,0 +1,53 @@
+# <file system>	<mount pt>	<type>	<options>	<dump>	<pass>
+#
+# Root is ext4 on the microSD (mmcblk0p1), mounted rw by the kernel via the
+# built-in command line -- not from here. This entry exists so that
+# `mount -o remount,rw /` has something to resolve.
+#
+# EXT4, AND THE JOURNAL IS THE WHOLE POINT.
+#
+# This used to be ext2 on mmcblk0p1, because e2fsprogs cannot be built for
+# this target (package/e2fsprogs has `depends on BR2_USE_MMU` for
+# util-linux/libblkid), so busybox mkfs.ext2 was the only filesystem maker
+# available and it makes no journal. That cost a filesystem:
+#
+#   EXT2-fs (mmcblk0p1): error: ext2_lookup: deleted inode referenced: 27
+#   ls: ./main.S: Input/output error
+#
+# and then kept spreading -- inode 2117 a few reboots later -- because a
+# development board gets power-cycled constantly and an unjournalled
+# filesystem has no way to recover a write that was in flight. There is no
+# e2fsck here either, for the same MMU reason, so nothing could repair it.
+#
+# The way out does not need e2fsprogs on the target at all: build the whole
+# filesystem on the host, where mkfs.ext4 exists, and stream the image onto
+# the card over the network. tools/sd-init.py's mkfs.ext2 path is what to
+# use when there is no network; this is what to use when there is.
+#
+# The kernel already had CONFIG_EXT4_FS and CONFIG_JBD2 enabled -- the
+# journal support was sitting there unused the whole time. It mounts
+# "r/w with ordered data mode" and survives unmount/remount cycles with
+# stable checksums. (An older note in this file warned that ext4 "hung on
+# the first write"; that was the ext4 driver mounting an *ext2* filesystem,
+# which is a different path. A real ext4 is fine.)
+#
+# noatime still earns its place: it stops reads from generating metadata
+# writes, which is free and reduces card wear.
+/dev/root	/		ext4	rw,noatime,noauto	0	1
+
+proc		/proc		proc	defaults	0	0
+devpts		/dev/pts	devpts	defaults,gid=5,mode=620,ptmxmode=0666	0	0
+tmpfs		/dev/shm	tmpfs	mode=1777	0	0
+tmpfs		/tmp		tmpfs	mode=1777	0	0
+tmpfs		/run		tmpfs	mode=0755,nosuid,nodev	0	0
+sysfs		/sys		sysfs	defaults	0	0
+
+# The card's second partition, 13.9 GiB -- everything past the 512 MiB root.
+# It briefly held the root filesystem while p1 was being rebuilt, so it
+# still carries a copy of it; reformat it when you want the space:
+#
+#   # mkfs.ext2 -F -L p4data /dev/mmcblk0p2 && mount /data
+#
+# noauto on purpose: nothing needs it yet, and an `auto` entry would fail
+# the boot-time mount for a partition whose contents are stale.
+/dev/mmcblk0p2	/data		ext2	noauto,noatime	0	2

@@ -1,0 +1,1309 @@
+--- a/arch/riscv/Kconfig.socs	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/Kconfig.socs	2026-05-05 11:14:25.133176820 +0200
+@@ -98,4 +98,20 @@
+ 	help
+ 	  This enables support for Canaan Kendryte K210 SoC platform hardware.
+ 
++config ARCH_ESPRESSIF
++	bool "Espressif SoCs"
++	help
++	  This enables support for Espressif SoC platform hardware.
++
++config SOC_ESP32P4
++	bool "Espressif ESP32-P4 SoC"
++	depends on !MMU && ARCH_ESPRESSIF
++	select RISCV_DMA_NONCOHERENT
++	select RISCV_NONSTANDARD_CACHE_OPS
++	select NOMMU_USERSPACE_POOL
++	help
++	  This enables support for the Espressif ESP32-P4 SoC.
++	  The ESP32-P4 features dual RV32IMAFC HP cores, LP core,
++	  and 32MB HEX PSRAM.
++
+ endmenu # "SoC selection"
+--- a/arch/riscv/boot/dts/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/boot/dts/Makefile	2026-05-05 11:14:25.076714773 +0200
+@@ -3,6 +3,7 @@
+ subdir-y += andes
+ subdir-y += canaan
+ subdir-y += eswin
++subdir-$(CONFIG_ARCH_ESPRESSIF) += espressif
+ subdir-y += microchip
+ subdir-y += renesas
+ subdir-y += sifive
+--- a/arch/riscv/include/asm/cacheflush.h	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/include/asm/cacheflush.h	2026-05-05 11:14:25.077147108 +0200
+@@ -10,12 +10,42 @@
+ 
+ static inline void local_flush_icache_all(void)
+ {
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * ESP32-P4 HP core: fence.i does not flush the external-memory
++	 * cache hierarchy (L1 I$/D$/L2). Use the ROM helpers at fixed
++	 * addresses to writeback all of D$/L2 and invalidate all of
++	 * I$/L2. Required for self-modifying code / loaded binaries in
++	 * PSRAM (binfmt_flat, kernel modules, eBPF, ...).
++	 *
++	 *   Cache_WriteBack_All(map)   @ 0x4fc00414
++	 *   Cache_Invalidate_All(map)  @ 0x4fc00404
++	 *   L1 DCACHE=BIT(4)=0x10, L1 ICACHE_MASK=0x3, L2=BIT(5)=0x20
++	 */
++	void (*wb_all)(uint32_t)  = (void (*)(uint32_t))0x4fc00414UL;
++	void (*inv_all)(uint32_t) = (void (*)(uint32_t))0x4fc00404UL;
++	wb_all(0x10);   /* L1 DCACHE writeback */
++	wb_all(0x20);   /* L2 writeback */
++	inv_all(0x03);  /* L1 ICACHE (both halves) invalidate */
++	inv_all(0x20);  /* L2 invalidate */
++#endif
+ 	asm volatile ("fence.i" ::: "memory");
+ }
+ 
+ static inline void local_flush_icache_range(unsigned long start,
+ 					    unsigned long end)
+ {
++#ifdef CONFIG_SOC_ESP32P4
++	void (*wb_addr)(uint32_t, uint32_t, uint32_t)  =
++		(void (*)(uint32_t, uint32_t, uint32_t))0x4fc003f4UL;
++	void (*inv_addr)(uint32_t, uint32_t, uint32_t) =
++		(void (*)(uint32_t, uint32_t, uint32_t))0x4fc003e4UL;
++	uint32_t size = (uint32_t)(end - start);
++	wb_addr(0x10, (uint32_t)start, size);   /* L1 D writeback */
++	wb_addr(0x20, (uint32_t)start, size);   /* L2 writeback */
++	inv_addr(0x03, (uint32_t)start, size);  /* L1 I invalidate */
++	inv_addr(0x20, (uint32_t)start, size);  /* L2 invalidate */
++#endif
+ 	local_flush_icache_all();
+ }
+ 
+--- a/arch/riscv/include/asm/ptrace.h	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/include/asm/ptrace.h	2026-05-05 11:14:25.077230025 +0200
+@@ -64,7 +64,34 @@
+ #define REG_FMT "%08lx"
+ #endif
+ 
++#ifdef CONFIG_SOC_ESP32P4
++/*
++ * ESP32-P4 HP core implements only M-mode, so userspace also runs in
++ * M-mode and mstatus.MPP is always M.  The generic "SR_PP == 0 means
++ * user" test is therefore useless on this platform.
++ *
++ * Instead, exploit entry.S's CSR_SCRATCH invariant:
++ *   SCRATCH == 0          while the kernel runs
++ *   SCRATCH == kernel-tp  while a user task runs
++ * At trap entry handle_exception swaps tp <-> SCRATCH and then saves
++ * the pre-swap SCRATCH value into pt_regs->tp.  So:
++ *   user  trap:  pt_regs->tp = user_tp     (!= current kernel tp)
++ *   kernel trap: pt_regs->tp = kernel_tp   (== current kernel tp)
++ * Compare regs->tp against the currently-running tp to decide.  This
++ * is reliable as long as the comparison is done before any context
++ * switch (true for every user_mode() call site in arch/riscv: they
++ * all run in the trap/syscall handler before scheduling).
++ */
++static __always_inline bool __esp32p4_user_mode(struct pt_regs *regs)
++{
++	unsigned long cur_tp;
++	__asm__ __volatile__("mv %0, tp" : "=r"(cur_tp));
++	return regs->tp != cur_tp;
++}
++#define user_mode(regs) __esp32p4_user_mode(regs)
++#else
+ #define user_mode(regs) (((regs)->status & SR_PP) == 0)
++#endif
+ 
+ #define MAX_REG_OFFSET offsetof(struct pt_regs, orig_a0)
+ 
+--- a/arch/riscv/include/asm/timex.h	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/include/asm/timex.h	2026-05-05 11:14:25.077313233 +0200
+@@ -14,24 +14,65 @@
+ 
+ #include <asm/clint.h>
+ 
+-#ifdef CONFIG_64BIT
++#ifdef CONFIG_SOC_ESP32P4
++/*
++ * On ESP32-P4 there is no CLINT.  The SYSTIMER (at fixed physical address
++ * 0x500E2000 on NOMMU, where physical == virtual) provides get_cycles().
++ * Unit 0 runs by default; we enable the register-file clock on first use.
++ *
++ * The latch sequence: write bit 30 of unit_op[0] (offset 0x04), then poll
++ * bit 29 (valid), then read unit_val[0].lo (offset 0x44).
++ */
++#define _ESP32P4_ST_BASE  ((volatile u32 *)0x500E2000UL)
++
++static inline u32 get_cycles(void)
++{
++	volatile u32 *st = _ESP32P4_ST_BASE;
++
++	/* Enable register-file clock (bit 31 of conf) if not already on */
++	if (!(st[0x00 / 4] & BIT(31)))
++		st[0x00 / 4] |= BIT(31) | BIT(30); /* clk_en + unit0_work_en */
++
++	st[0x04 / 4] = BIT(30);                  /* trigger latch */
++	while (!(st[0x04 / 4] & BIT(29)))        /* wait valid */
++		;
++	return st[0x44 / 4];                      /* unit_val[0].lo */
++}
++#define get_cycles get_cycles
++
++static inline u32 get_cycles_hi(void)
++{
++	volatile u32 *st = _ESP32P4_ST_BASE;
++
++	st[0x04 / 4] = BIT(30);
++	while (!(st[0x04 / 4] & BIT(29)))
++		;
++	return st[0x40 / 4] & 0xFFFFF;           /* unit_val[0].hi (20 bits) */
++}
++#define get_cycles_hi get_cycles_hi
++
++#elif defined(CONFIG_64BIT)
+ static inline cycles_t get_cycles(void)
+ {
+ 	return readq_relaxed(clint_time_val);
+ }
+-#else /* !CONFIG_64BIT */
++#else /* !CONFIG_64BIT && !CONFIG_SOC_ESP32P4 */
+ static inline u32 get_cycles(void)
+ {
++	if (unlikely(!clint_time_val))
++		return 0;
+ 	return readl_relaxed(((u32 *)clint_time_val));
+ }
+ #define get_cycles get_cycles
+ 
+ static inline u32 get_cycles_hi(void)
+ {
++	if (unlikely(!clint_time_val))
++		return 0;
+ 	return readl_relaxed(((u32 *)clint_time_val) + 1);
+ }
+ #define get_cycles_hi get_cycles_hi
+-#endif /* CONFIG_64BIT */
++#endif /* CONFIG_SOC_ESP32P4 / CONFIG_64BIT */
+ 
+ /*
+  * Much like MIPS, we may not have a viable counter to use at an early point
+--- a/arch/riscv/kernel/entry.S	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/kernel/entry.S	2026-05-05 11:14:25.077426859 +0200
+@@ -92,7 +92,10 @@
+ 	REG_L	a0, TASK_TI_A0(tp)
+ .endm
+ 
+-
++#ifdef CONFIG_SOC_ESP32P4
++/* CLIC mode requires mtvec.BASE 64-byte aligned (bits[5:2] are zeroed by HW) */
++.balign 64
++#endif
+ SYM_CODE_START(handle_exception)
+ 	/*
+ 	 * If coming from userspace, preserve the user thread pointer and load
+@@ -152,12 +155,32 @@
+ 	csrr s3, CSR_TVAL
+ 	csrr s4, CSR_CAUSE
+ 	csrr s5, CSR_SCRATCH
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * CLIC v0.9 bidirectional shim (entry side):
++	 * mstatus.MPP[12:11] and mstatus.MPIE[7] are hardwired to 0 on this
++	 * core; the real saved privilege / IE lives in mcause:
++	 *   mcause[29:28] = MPP, mcause[27] = MPIE.
++	 * Standard Linux C (user_mode(), start_thread(), signal delivery)
++	 * only looks at pt_regs->status. Reconstruct MPP/MPIE into s1
++	 * before it gets saved to PT_STATUS so those helpers see a sane
++	 * RISC-V mstatus view.
++	 */
++	srli t0, s4, 28 - 11		/* mcause[29:28] -> t0[12:11] (MPP) */
++	li   t1, (3 << 11)
++	and  t0, t0, t1
++	or   s1, s1, t0
++	srli t0, s4, 27 - 7		/* mcause[27] -> t0[7] (MPIE) */
++	li   t1, (1 << 7)
++	and  t0, t0, t1
++	or   s1, s1, t0
++#endif
+ 	REG_S s0, PT_SP(sp)
+ 	REG_S s1, PT_STATUS(sp)
+ 	REG_S s2, PT_EPC(sp)
+ 	REG_S s3, PT_BADADDR(sp)
+ 	REG_S s4, PT_CAUSE(sp)
+ 	REG_S s5, PT_TP(sp)
+ 
+ 	/*
+ 	 * Set the scratch register to 0, so that if a recursive exception
+@@ -187,6 +210,59 @@
+ 	call do_irq
+ 	j ret_from_exception
+ 1:
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * CLIC mode packs mpil into mcause bits [23:16] and mpp/mpie into
++	 * bits [29:27]. Two competing needs:
++	 *   1. The exception vector table is indexed by plain exception
++	 *      code (bits [11:0]) — extra high bits blow past the table.
++	 *   2. The return path (entry.S around ret_from_exception) restores
++	 *      CSR_CAUSE from pt_regs before mret. CLIC v0.9 mret reads
++	 *      mpie out of mcause to populate mstatus.MIE on return to
++	 *      user. If mpie is stripped, every syscall returns to user
++	 *      with interrupts masked, deadlocking blocking read/nanosleep.
++	 *
++	 * So: store mcause with mpil cleared but mpp/mpie intact, and
++	 * compute the vector-table index from a fully masked local copy.
++	 */
++	li t0, 0x00FF0000
++	not t0, t0
++	and s4, s4, t0          /* clear mpil (bits 23:16), keep mpp/mpie */
++	/*
++	 * ecall_m redirect fix-up: the excp_vect_table entry for exccode 11
++	 * (ecall from M-mode) dispatches to do_trap_ecall_u on P4, but
++	 * generic code (arch_do_signal_or_restart's syscall-restart check)
++	 * compares pt_regs->cause against EXC_SYSCALL (=8), so ERESTARTSYS
++	 * etc. are silently broken unless the STORED cause reads 8. s4
++	 * itself must keep exception code 11 (mpp/mpie bits are irrelevant
++	 * to the vector-table index below, which only consults bits
++	 * [11:0]) so the lookup still lands on do_trap_ecall_u -- only the
++	 * value written to PT_CAUSE is substituted.
++	 */
++	li   t0, 0xfff
++	and  t0, s4, t0			/* NB: not "andi t0,s4,0xfff" -- andi's
++					 * 12-bit immediate is sign-extended,
++					 * so 0xfff sign-extends to -1 and the
++					 * mask becomes a no-op. */
++	li   t1, 11			/* EXC_SYSCALL_M (ecall from M) */
++	bne  t0, t1, 10f
++	li   t1, 8			/* EXC_SYSCALL (U-mode ecall, upstream) */
++	REG_S t1, PT_CAUSE(sp)
++	j    11f
++10:
++	REG_S s4, PT_CAUSE(sp)
++11:
++	/* local copy for indexing: clear everything except bits [11:0] */
++	li t0, 0xfff
++	and t1, s4, t0
++	slli t0, t1, RISCV_LGPTR
++	la t1, excp_vect_table
++	la t2, excp_vect_table_end
++	add t0, t1, t0
++	bgeu t0, t2, 3f
++	REG_L t1, 0(t0)
++	j 2f
++#endif
+ 	/* Handle other exceptions */
+ 	slli t0, s4, RISCV_LGPTR
+ 	la t1, excp_vect_table
+@@ -212,6 +288,20 @@
+  */
+ SYM_CODE_START_NOALIGN(ret_from_exception)
+ 	REG_L s0, PT_STATUS(sp)
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * ESP32-P4 HP core has no U-mode, so user tasks run in M-mode and
++	 * mstatus.MPP is always M.  Use entry.S's SCRATCH invariant:
++	 * pt_regs->tp holds the pre-trap SCRATCH value, which equals the
++	 * current kernel tp if the trap came from kernel context, and the
++	 * user task's tp otherwise.  Materialize an "is-kernel" flag
++	 * (non-zero) so the existing "bnez s0, 1f" (skip user-return
++	 * work) keeps working.
++	 */
++	REG_L t0, PT_TP(sp)
++	sub s0, t0, tp        /* 0 when trap came from kernel */
++	seqz s0, s0           /* flip: non-zero => was kernel */
++#else
+ #ifdef CONFIG_RISCV_M_MODE
+ 	/* the MPP value is too large to be used as an immediate arg for addi */
+ 	li t0, SR_MPP
+@@ -219,6 +309,7 @@
+ #else
+ 	andi s0, s0, SR_SPP
+ #endif
++#endif
+ 	bnez s0, 1f
+ 
+ #ifdef CONFIG_KSTACK_ERASE
+@@ -266,6 +357,48 @@
+ 	csrw CSR_STATUS, a0
+ 	csrw CSR_EPC, a2
+ 
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * CLIC v0.9 bidirectional shim (exit side):
++	 * Linux C code (start_thread, signal setup, ptrace) may have rewritten
++	 * pt_regs->status but leaves pt_regs->cause alone. signal delivery even
++	 * sets pt_regs->cause = -1UL to suppress syscall restart, which sets
++	 * bits 31 (INT) and 30 (MINHV) — these MUST be cleared before mret or
++	 * CLIC v0.9 treats mret as returning from a vectored interrupt handler.
++	 *
++	 * Mask clears: [31:27] (INT, MINHV, MPP, MPIE) and [23:16] (MPIL).
++	 * Then OR in fresh MPP/MPIE from regs->status.
++	 *
++	 * a0 still holds pt_regs->status (loaded above).
++	 */
++	REG_L a3, PT_CAUSE(sp)
++	/*
++	 * Clear [30:27] (MINHV, MPP, MPIE) and [23:16] (MPIL). Preserve
++	 * bit 31 (INT): interrupt returns need INT=1 in mcause for CLIC
++	 * mret semantics; stripping it breaks IRQ return paths.
++	 *
++	 * Previously this mask was (0x7UL << 27), which cleared only
++	 * [29:27] and left MINHV(30) to leak through. Any future code
++	 * that sets pt_regs->cause = -1UL (rt_sigreturn did) then wedged
++	 * mret — hardware interpreted mepc as a vector-table entry and
++	 * refetched, causing an invisible trap loop. Widening to
++	 * (0xFUL << 27) closes the MINHV leak without touching INT.
++	 */
++	li    a5, ~((0xFFUL << 16) | (0xFUL << 27))
++	and   a3, a3, a5
++	/* MPP: status[12:11] -> cause[29:28] */
++	srli  a5, a0, 11
++	andi  a5, a5, 0x3
++	slli  a5, a5, 28
++	or    a3, a3, a5
++	/* MPIE: status[7] -> cause[27] */
++	srli  a5, a0, 7
++	andi  a5, a5, 0x1
++	slli  a5, a5, 27
++	or    a3, a3, a5
++	csrw  CSR_CAUSE, a3
++#endif
++
+ 	REG_L x1,  PT_RA(sp)
+ 	REG_L x3,  PT_GP(sp)
+ 	REG_L x4,  PT_TP(sp)
+@@ -454,7 +587,15 @@
+ 	RISCV_PTR do_trap_ecall_u /* system call */
+ 	RISCV_PTR do_trap_ecall_s
+ 	RISCV_PTR do_trap_unknown
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * ESP32-P4 has no U-mode: userspace ecall arrives as ecall_m.
++	 * Dispatch it through the normal syscall path.
++	 */
++	RISCV_PTR do_trap_ecall_u
++#else
+ 	RISCV_PTR do_trap_ecall_m
++#endif
+ 	/* instruction page fault */
+ 	ALT_PAGE_FAULT(RISCV_PTR do_page_fault)
+ 	RISCV_PTR do_page_fault   /* load page fault */
+--- a/arch/riscv/kernel/head.S	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/kernel/head.S	2026-05-05 11:14:25.077535651 +0200
+@@ -189,6 +189,18 @@
+ .Lsetup_trap_vector:
+ 	/* Set trap vector to exception handler */
+ 	la a0, handle_exception
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * Enable CLIC mode (mtvec.MODE=3, non-vectored).  Without this,
++	 * mtvec.MODE=0 (CLINT compat) and the CLIC only drives mip.MTIP/MEIP
++	 * from slots 3/7/11.  Peripheral interrupts routed to slots 16-239
++	 * via the interrupt matrix are invisible to the CPU.
++	 *
++	 * With MODE=3 and shv=0, all traps still go to mtvec.BASE
++	 * (handle_exception), but mcause now encodes the CLIC slot number.
++	 */
++	ori a0, a0, 3
++#endif
+ 	csrw CSR_TVEC, a0
+ 
+ 	/*
+--- a/arch/riscv/kernel/signal.c	2026-04-30 11:13:53.000000000 +0200
++++ b/arch/riscv/kernel/signal.c	2026-05-05 11:14:25.077620651 +0200
+@@ -249,7 +249,28 @@
+ 	if (restore_altstack(&frame->uc.uc_stack))
+ 		goto badframe;
+ 
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * Upstream sets regs->cause = -1UL here to make the downstream
++	 * (regs->cause == EXC_SYSCALL) syscall-restart check false.
++	 *
++	 * On ESP32-P4 CLIC v0.9 the exit shim in entry.S writes
++	 * pt_regs->cause back into mcause; -1UL leaves INT (bit 31) and
++	 * MINHV (bit 30) set after the shim mask. mret with MINHV=1
++	 * causes hardware to treat mepc as a CLIC vector-table entry
++	 * address and refetch, silently wedging the CPU in an invisible
++	 * trap-refetch loop (timer IRQs can't preempt it).
++	 *
++	 * On P4 the syscall-restart check is a no-op regardless: the
++	 * ecall_m->do_trap_ecall_u redirect in entry.S leaves
++	 * pt_regs->cause at 0xB, not EXC_SYSCALL (8), so the downstream
++	 * compare is already false. Clearing cause to 0 is therefore
++	 * semantically equivalent and avoids the MINHV footgun.
++	 */
++	regs->cause = 0;
++#else
+ 	regs->cause = -1UL;
++#endif
+ 
+ 	return regs->a0;
+ 
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/arch/riscv/configs/esp32p4_defconfig	2026-05-05 11:14:25.081144828 +0200
+@@ -0,0 +1,92 @@
++# CONFIG_CPU_ISOLATION is not set
++CONFIG_LOG_BUF_SHIFT=16
++CONFIG_CC_OPTIMIZE_FOR_SIZE=y
++CONFIG_EXPERT=y
++# CONFIG_SYSFS_SYSCALL is not set
++# CONFIG_FHANDLE is not set
++CONFIG_BASE_SMALL=y
++# CONFIG_FUTEX is not set
++# CONFIG_EPOLL is not set
++# CONFIG_SIGNALFD is not set
++# CONFIG_TIMERFD is not set
++# CONFIG_EVENTFD is not set
++# CONFIG_AIO is not set
++# CONFIG_IO_URING is not set
++# CONFIG_ADVISE_SYSCALLS is not set
++# CONFIG_KALLSYMS is not set
++# CONFIG_VM_EVENT_COUNTERS is not set
++# CONFIG_COMPAT_BRK is not set
++CONFIG_SLUB=y
++CONFIG_SLUB_TINY=y
++# CONFIG_MMU is not set
++# 32-bit RV32IMAFC
++CONFIG_ARCH_RV32I=y
++CONFIG_NONPORTABLE=y
++CONFIG_RISCV_M_MODE=y
++# ESP32-P4 SoC
++CONFIG_ARCH_ESPRESSIF=y
++CONFIG_SOC_ESP32P4=y
++# Single core (badge runs Linux on one HP core)
++# CONFIG_SMP is not set
++CONFIG_CMDLINE="earlycon console=ttyESP0,115200 keep_bootcon loglevel=8"
++CONFIG_CMDLINE_FORCE=y
++# CONFIG_SECCOMP is not set
++# CONFIG_STACKPROTECTOR is not set
++# CONFIG_GCC_PLUGINS is not set
++# CONFIG_BLOCK is not set
++CONFIG_BINFMT_FLAT=y
++# CONFIG_COREDUMP is not set
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++# CONFIG_FW_LOADER is not set
++# CONFIG_ALLOW_DEV_COREDUMP is not set
++# CONFIG_INPUT is not set
++# CONFIG_SERIO is not set
++# CONFIG_VT is not set
++# CONFIG_UNIX98_PTYS is not set
++# CONFIG_LEGACY_PTYS is not set
++# CONFIG_LDISC_AUTOLOAD is not set
++# CONFIG_HW_RANDOM is not set
++# CONFIG_DEVMEM is not set
++CONFIG_ESP32P4_CLIC=y
++CONFIG_ESP32P4_SYSTIMER=y
++CONFIG_SERIAL_ESP32=y
++CONFIG_SERIAL_ESP32_CONSOLE=y
++# CONFIG_HID is not set
++# CONFIG_USB_SUPPORT is not set
++# CONFIG_VIRTIO_MENU is not set
++# CONFIG_VHOST_MENU is not set
++# CONFIG_FILE_LOCKING is not set
++# CONFIG_DNOTIFY is not set
++# CONFIG_INOTIFY_USER is not set
++# CONFIG_MISC_FILESYSTEMS is not set
++CONFIG_LSM="[]"
++CONFIG_PRINTK_TIME=y
++# CONFIG_SYMBOLIC_ERRNAME is not set
++# CONFIG_DEBUG_BUGVERBOSE is not set
++# CONFIG_SECTION_MISMATCH_WARN_ONLY is not set
++# CONFIG_FRAME_POINTER is not set
++# CONFIG_DEBUG_MISC is not set
++CONFIG_PANIC_ON_OOPS=y
++# CONFIG_SCHED_DEBUG is not set
++# CONFIG_RCU_TRACE is not set
++# CONFIG_FTRACE is not set
++# CONFIG_RUNTIME_TESTING_MENU is not set
++# DRM/MIPI-DSI display subsystem
++CONFIG_REGULATOR=y
++CONFIG_REGULATOR_FIXED_VOLTAGE=y
++CONFIG_BACKLIGHT_CLASS_DEVICE=y
++CONFIG_BACKLIGHT_GPIO=y
++CONFIG_GPIOLIB=y
++CONFIG_OF_GPIO=y
++CONFIG_DRM=y
++CONFIG_DRM_PANEL=y
++CONFIG_DRM_PANEL_BRIDGE=y
++CONFIG_DRM_MIPI_DSI=y
++CONFIG_DRM_DW_MIPI_DSI=y
++CONFIG_DRM_PANEL_SITRONIX_ST7703=y
++CONFIG_DRM_ESP32P4=y
++CONFIG_CMA=y
++CONFIG_DMA_CMA=y
++CONFIG_CMA_SIZE_MBYTES=4
++CONFIG_GPIO_ESP32P4=y
+--- a/drivers/cache/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/cache/Makefile	2026-05-05 11:14:25.113695469 +0200
+@@ -3,3 +3,4 @@
+ obj-$(CONFIG_AX45MP_L2_CACHE)		+= ax45mp_cache.o
+ obj-$(CONFIG_SIFIVE_CCACHE)		+= sifive_ccache.o
+ obj-$(CONFIG_STARFIVE_STARLINK_CACHE)	+= starfive_starlink_cache.o
++obj-$(CONFIG_SOC_ESP32P4)		+= esp32p4_cache.o
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/cache/esp32p4_cache.c	2026-05-05 11:14:25.113798386 +0200
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ESP32-P4 noncoherent DMA cache ops
++ *
++ * The HP RV32 core's external-memory cache (L1 D$ + L2) is not coherent
++ * with bus-master DMA into PSRAM (IDMAC, GDMA, ...). The SoC ROM exposes
++ * fixed-address thunks that drive the cache controller; reuse them as
++ * the riscv_nonstd_cache_ops backend so dma-direct's
++ * arch_sync_dma_for_{device,cpu} hooks do real cache management instead
++ * of being silent no-ops.
++ *
++ * Cache map bits (passed as the first argument to the ROM helpers):
++ *   L1 ICACHE = 0x03 (both ways)
++ *   L1 DCACHE = 0x10 (BIT(4))
++ *   L2        = 0x20 (BIT(5))
++ *
++ * Block size is 64 B (matches L1_CACHE_BYTES on this build).
++ */
++
++#include <linux/init.h>
++#include <linux/printk.h>
++#include <linux/types.h>
++#include <asm/cacheflush.h>
++#include <asm/dma-noncoherent.h>
++
++#define ESP32P4_CACHE_MAP_L1D	0x10
++#define ESP32P4_CACHE_MAP_L2	0x20
++
++typedef void (*esp32p4_cache_op_t)(uint32_t map, uint32_t addr, uint32_t size);
++
++#define esp32p4_cache_writeback  ((esp32p4_cache_op_t)0x4fc003f4UL)
++#define esp32p4_cache_invalidate ((esp32p4_cache_op_t)0x4fc003e4UL)
++
++static void esp32p4_dma_cache_wback(phys_addr_t paddr, size_t size)
++{
++	esp32p4_cache_writeback(ESP32P4_CACHE_MAP_L1D, (uint32_t)paddr, (uint32_t)size);
++	esp32p4_cache_writeback(ESP32P4_CACHE_MAP_L2,  (uint32_t)paddr, (uint32_t)size);
++}
++
++static void esp32p4_dma_cache_inv(phys_addr_t paddr, size_t size)
++{
++	esp32p4_cache_invalidate(ESP32P4_CACHE_MAP_L1D, (uint32_t)paddr, (uint32_t)size);
++	esp32p4_cache_invalidate(ESP32P4_CACHE_MAP_L2,  (uint32_t)paddr, (uint32_t)size);
++}
++
++static void esp32p4_dma_cache_wback_inv(phys_addr_t paddr, size_t size)
++{
++	esp32p4_cache_writeback(ESP32P4_CACHE_MAP_L1D, (uint32_t)paddr, (uint32_t)size);
++	esp32p4_cache_writeback(ESP32P4_CACHE_MAP_L2,  (uint32_t)paddr, (uint32_t)size);
++	esp32p4_cache_invalidate(ESP32P4_CACHE_MAP_L1D, (uint32_t)paddr, (uint32_t)size);
++	esp32p4_cache_invalidate(ESP32P4_CACHE_MAP_L2,  (uint32_t)paddr, (uint32_t)size);
++}
++
++static const struct riscv_nonstd_cache_ops esp32p4_cache_ops __initconst = {
++	.wback     = &esp32p4_dma_cache_wback,
++	.inv       = &esp32p4_dma_cache_inv,
++	.wback_inv = &esp32p4_dma_cache_wback_inv,
++};
++
++static int __init esp32p4_cache_init(void)
++{
++	riscv_cbom_block_size = L1_CACHE_BYTES;
++	riscv_noncoherent_supported();
++	riscv_noncoherent_register_cache_ops(&esp32p4_cache_ops);
++	pr_info("esp32p4_cache: registered ROM-thunk noncoherent ops, block=%d\n",
++		L1_CACHE_BYTES);
++	return 0;
++}
++arch_initcall(esp32p4_cache_init);
+--- a/drivers/clocksource/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/clocksource/Kconfig	2026-05-05 11:14:25.077723068 +0200
+@@ -673,6 +673,18 @@
+ 	  This option enables the CLINT timer for RISC-V systems.  The CLINT
+ 	  driver is usually used for NoMMU RISC-V systems.
+ 
++config ESP32P4_SYSTIMER
++	bool "ESP32-P4 SYSTIMER clocksource/clockevent" if COMPILE_TEST
++	depends on GENERIC_SCHED_CLOCK && RISCV && SOC_ESP32P4
++	default SOC_ESP32P4
++	select TIMER_PROBE
++	select TIMER_OF
++	help
++	  Clocksource and clockevent driver for the Espressif ESP32-P4 SoC.
++	  The SYSTIMER is a 52-bit counter at 16 MHz.  SYSTIMER alarm 0 is
++	  routed to the machine-timer CLIC slot (slot 7) so no separate CLIC
++	  irqchip driver is required.
++
+ config CSKY_MP_TIMER
+ 	bool "SMP Timer for the C-SKY platform" if COMPILE_TEST
+ 	depends on CSKY
+--- a/drivers/clocksource/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/clocksource/Makefile	2026-05-05 11:14:25.077816360 +0200
+@@ -84,6 +84,7 @@
+ obj-$(CONFIG_X86_NUMACHIP)		+= numachip.o
+ obj-$(CONFIG_RISCV_TIMER)		+= timer-riscv.o
+ obj-$(CONFIG_CLINT_TIMER)		+= timer-clint.o
++obj-$(CONFIG_ESP32P4_SYSTIMER)		+= timer-esp32p4-systimer.o
+ obj-$(CONFIG_CSKY_MP_TIMER)		+= timer-mp-csky.o
+ obj-$(CONFIG_GX6605S_TIMER)		+= timer-gx6605s.o
+ obj-$(CONFIG_HYPERV_TIMER)		+= hyperv_timer.o
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/clocksource/timer-esp32p4-systimer.c	2026-05-05 11:14:25.077864193 +0200
+@@ -0,0 +1,226 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ESP32-P4 SYSTIMER clocksource and clockevent driver
++ *
++ * The SYSTIMER is a 52-bit counter running at 16 MHz (XTAL).  It requires
++ * an explicit latch-then-read sequence to capture a consistent value.
++ *
++ * SYSTIMER alarm 0 is used for the clockevent.  The interrupt is routed
++ * through the ESP32-P4 interrupt matrix to CLIC slot 17 (first external
++ * peripheral slot), dispatched by the ESP32-P4 CLIC irqchip driver.
++ * INTMTX routing is handled by the CLIC irqchip driver via the 2-cell
++ * interrupt specifier in the DTS.
++ */
++
++#define pr_fmt(fmt) "esp32p4-systimer: " fmt
++
++#include <linux/clockchips.h>
++#include <linux/clocksource.h>
++#include <linux/interrupt.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/sched_clock.h>
++#include <asm/delay.h>		/* riscv_timebase */
++
++/* SYSTIMER register byte offsets (struct size = 0x100) */
++#define ST_CONF          0x00   /* clk_en[31], unit0_work_en[30], target0_work_en[24] */
++#define ST_UNIT0_OP      0x04   /* update[30] (WT), valid[29] (RO) */
++#define ST_TARGET0_HI    0x1C   /* target high 20 bits */
++#define ST_TARGET0_LO    0x20   /* target low 32 bits */
++#define ST_TARGET0_CONF  0x34   /* period_mode[30]=0 (oneshot), unit_sel[31]=0 (unit0) */
++#define ST_UNIT0_VAL_HI  0x40   /* latched counter high 20 bits */
++#define ST_UNIT0_VAL_LO  0x44   /* latched counter low 32 bits */
++#define ST_COMP0_LOAD    0x50   /* write 1 to apply target_val[0] to comparator */
++#define ST_INT_ENA       0x64   /* target0_int_ena[0] */
++#define ST_INT_CLR       0x6C   /* target0_int_clr[0] (WT) */
++#define ST_INT_ST        0x70   /* target0_int_st[0] (RO) */
++
++#define ST_CONF_CLK_EN         BIT(31)
++#define ST_CONF_UNIT0_WORK_EN  BIT(30)
++#define ST_CONF_TARGET0_EN     BIT(24)
++#define ST_UNIT0_OP_UPDATE     BIT(30)
++#define ST_UNIT0_OP_VALID      BIT(29)
++
++/* CLIC slot 17 is used for SYSTIMER (first external peripheral slot). */
++#define CLIC_SLOT_SYSTIMER  17
++
++/*
++ * CLIC slot 17 is edge-triggered (DTS: IRQ_TYPE_EDGE_RISING). The flow
++ * handler we install (handle_percpu_devid_irq) does not ack the CLIC,
++ * so INTIP latches on each rising edge and we must clear it from this
++ * ISR. Without this, the second alarm sees INTIP already pending and
++ * no new edge is delivered — scheduler tick dies after the first fire.
++ *
++ * CLIC base and INTIP offset come from the irqchip driver.
++ */
++#define CLIC_BASE        0x20801000
++#define CLIC_INTIP_OFF   0
++
++static void __iomem *st_base;
++static unsigned int esp32p4_timer_irq;
++static void __iomem *clic_slot17_intip;
++
++/* ------------------------------------------------------------------ */
++/*  Counter read (52-bit, 16 MHz)                                      */
++/* ------------------------------------------------------------------ */
++
++static u64 notrace esp32p4_systimer_read64(void)
++{
++	u32 hi, lo;
++
++	/* Trigger latch of unit 0 counter */
++	writel(ST_UNIT0_OP_UPDATE, st_base + ST_UNIT0_OP);
++	/* Wait for the captured value to be valid (typically 2-3 cycles) */
++	while (!(readl(st_base + ST_UNIT0_OP) & ST_UNIT0_OP_VALID))
++		;
++	hi = readl(st_base + ST_UNIT0_VAL_HI) & 0xFFFFF;
++	lo = readl(st_base + ST_UNIT0_VAL_LO);
++
++	return ((u64)hi << 32) | lo;
++}
++
++static u64 esp32p4_cs_read(struct clocksource *cs)
++{
++	return esp32p4_systimer_read64();
++}
++
++static struct clocksource esp32p4_clocksource = {
++	.name   = "esp32p4-systimer",
++	.rating = 300,
++	.read   = esp32p4_cs_read,
++	.mask   = CLOCKSOURCE_MASK(52),
++	.flags  = CLOCK_SOURCE_IS_CONTINUOUS,
++};
++
++/* ------------------------------------------------------------------ */
++/*  Clockevent (oneshot via alarm 0)                                   */
++/* ------------------------------------------------------------------ */
++
++static DEFINE_PER_CPU(struct clock_event_device, esp32p4_clock_event) = {
++	.name     = "esp32p4-systimer",
++	.features = CLOCK_EVT_FEAT_ONESHOT,
++	.rating   = 300,
++};
++
++static int esp32p4_clkevt_set_next(unsigned long delta,
++				    struct clock_event_device *ce)
++{
++	u64 target;
++	u32 conf;
++
++	/* Disable alarm while reprogramming */
++	conf = readl(st_base + ST_CONF);
++	writel(conf & ~ST_CONF_TARGET0_EN, st_base + ST_CONF);
++
++	target = esp32p4_systimer_read64() + delta;
++	writel((u32)(target >> 32) & 0xFFFFF, st_base + ST_TARGET0_HI);
++	writel((u32)target,                    st_base + ST_TARGET0_LO);
++
++	/* Oneshot mode, unit 0 — clear period_mode and unit_sel */
++	writel(0, st_base + ST_TARGET0_CONF);
++
++	/* Sync target value into hardware comparator */
++	writel(1, st_base + ST_COMP0_LOAD);
++
++	/* Enable target-0 interrupt and re-arm alarm */
++	writel(readl(st_base + ST_INT_ENA) | BIT(0), st_base + ST_INT_ENA);
++	writel(readl(st_base + ST_CONF) | ST_CONF_TARGET0_EN, st_base + ST_CONF);
++
++	return 0;
++}
++
++static irqreturn_t esp32p4_timer_interrupt(int irq, void *dev_id)
++{
++	struct clock_event_device *ce = this_cpu_ptr(&esp32p4_clock_event);
++
++	/* Disable alarm and clear pending interrupt at the SYSTIMER */
++	writel(readl(st_base + ST_CONF) & ~ST_CONF_TARGET0_EN, st_base + ST_CONF);
++	writel(BIT(0), st_base + ST_INT_CLR);
++
++	/*
++	 * Clear CLIC slot 17 pending bit. handle_percpu_devid_irq does not
++	 * call irq_ack, so without this the edge-triggered slot stays latched
++	 * and no further rising edges are seen after the first fire.
++	 */
++	if (clic_slot17_intip)
++		writeb(0, clic_slot17_intip);
++
++	ce->event_handler(ce);
++	return IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------------ */
++/*  Initialisation                                                      */
++/* ------------------------------------------------------------------ */
++
++static int __init esp32p4_systimer_init(struct device_node *np)
++{
++	struct clock_event_device *ce;
++	int ret;
++
++	st_base = of_iomap(np, 0);
++	if (!st_base) {
++		pr_err("failed to map SYSTIMER registers\n");
++		return -ENOMEM;
++	}
++
++	/* Map CLIC slot 17 INTIP byte for direct ack from our ISR. */
++	clic_slot17_intip = ioremap(CLIC_BASE + CLIC_SLOT_SYSTIMER * 4 +
++				    CLIC_INTIP_OFF, 1);
++	if (!clic_slot17_intip)
++		pr_warn("could not map CLIC INTIP for slot %d; tick may stall\n",
++			CLIC_SLOT_SYSTIMER);
++
++	/* Enable SYSTIMER register file clock and counter unit 0 */
++	writel(readl(st_base + ST_CONF) | ST_CONF_CLK_EN | ST_CONF_UNIT0_WORK_EN,
++	       st_base + ST_CONF);
++
++	/* Clear any stale alarm-0 interrupt */
++	writel(BIT(0), st_base + ST_INT_CLR);
++	writel(readl(st_base + ST_INT_ENA) & ~BIT(0), st_base + ST_INT_ENA);
++
++	/* clocksource */
++	ret = clocksource_register_hz(&esp32p4_clocksource, riscv_timebase);
++	if (ret) {
++		pr_err("clocksource register failed (%d)\n", ret);
++		return ret;
++	}
++	sched_clock_register(esp32p4_systimer_read64, 52, riscv_timebase);
++
++	/* clockevent — single core, configure directly for CPU 0 */
++	esp32p4_timer_irq = irq_of_parse_and_map(np, 0);
++	if (!esp32p4_timer_irq) {
++		pr_err("failed to map timer IRQ\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * The CLIC domain map uses handle_edge_irq (non-percpu) by default.
++	 * Promote this IRQ to percpu so the clock event subsystem can use
++	 * request_percpu_irq / enable_percpu_irq on an SMP-capable kernel.
++	 */
++	irq_set_percpu_devid(esp32p4_timer_irq);
++	irq_set_chip_and_handler(esp32p4_timer_irq,
++				 irq_get_chip(esp32p4_timer_irq),
++				 handle_percpu_devid_irq);
++
++	ret = request_percpu_irq(esp32p4_timer_irq, esp32p4_timer_interrupt,
++				  "esp32p4-systimer", &esp32p4_clock_event);
++	if (ret) {
++		pr_err("request_percpu_irq failed (%d)\n", ret);
++		return ret;
++	}
++
++	ce = this_cpu_ptr(&esp32p4_clock_event);
++	ce->cpumask = cpumask_of(0);
++	ce->set_next_event = esp32p4_clkevt_set_next;
++	clockevents_config_and_register(ce, riscv_timebase, 100, ULONG_MAX);
++	enable_percpu_irq(esp32p4_timer_irq, IRQ_TYPE_NONE);
++
++	pr_info("SYSTIMER @ %lu Hz, IRQ %u (CLIC slot %d)\n",
++		riscv_timebase, esp32p4_timer_irq, CLIC_SLOT_SYSTIMER);
++	return 0;
++}
++
++TIMER_OF_DECLARE(esp32p4_systimer, "espressif,esp32p4-systimer",
++		 esp32p4_systimer_init);
+--- a/drivers/irqchip/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/irqchip/Kconfig	2026-05-05 11:14:25.077979277 +0200
+@@ -823,4 +823,13 @@
+ 	  chained controller, routing all interrupt source in P-Chip to
+ 	  the primary controller on C-Chip.
+ 
++config ESP32P4_CLIC
++	bool "Espressif ESP32-P4 CLIC interrupt controller"
++	depends on SOC_ESP32P4
++	select IRQ_DOMAIN
++	help
++	  Support for the ESP32-P4 Core-Local Interrupt Controller (CLIC).
++	  Routes peripheral interrupts (slots 16-239) via the interrupt matrix
++	  to the HP RISC-V core. Required for any peripheral interrupt support.
++
+ endmenu
+--- a/drivers/irqchip/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/irqchip/Makefile	2026-05-05 11:14:25.078075027 +0200
+@@ -136,3 +136,4 @@
+ obj-$(CONFIG_MCHP_EIC)			+= irq-mchp-eic.o
+ obj-$(CONFIG_SOPHGO_SG2042_MSI)		+= irq-sg2042-msi.o
+ obj-$(CONFIG_SUNPLUS_SP7021_INTC)	+= irq-sp7021-intc.o
++obj-$(CONFIG_ESP32P4_CLIC)		+= irq-esp32p4-clic.o
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/irqchip/irq-esp32p4-clic.c	2026-05-05 11:14:25.078122902 +0200
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ESP32-P4 CLIC (Core-Local Interrupt Controller) irqchip driver.
++ *
++ * Per-slot trigger mode via 3-cell DTS specifier:
++ *   <clic_slot intmtx_source IRQ_TYPE_*>
++ *   cell[2] omitted or IRQ_TYPE_NONE → level-high (default).
++ *   IRQ_TYPE_EDGE_RISING → rising-edge, handle_edge_irq.
++ *   IRQ_TYPE_LEVEL_HIGH  → level,       handle_level_irq.
++ *
++ * Note: clic_irq_set_type programs clicintattr only. It does NOT
++ * change the flow handler — drivers that install handle_percpu_devid_irq
++ * (SYSTIMER) via irq_set_chip_and_handler() must keep that setting,
++ * but __setup_irq invokes chip->irq_set_type, which would otherwise
++ * clobber it back to handle_edge_irq/handle_level_irq. The initial
++ * flow handler is set once in clic_domain_map based on the cached
++ * xlate trigger.
++ */
++
++#define pr_fmt(fmt) "esp32p4-clic: " fmt
++
++#include <linux/irq.h>
++#include <linux/irqchip.h>
++#include <linux/io.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++
++#define CLIC_NUM_IRQS     240
++#define CLIC_INTIP_OFF      0
++#define CLIC_INTIE_OFF      1
++#define CLIC_INTATTR_OFF    2
++#define CLIC_INTCTL_OFF     3
++
++#define CLIC_INTATTR_MMODE_LEVEL 0xC0U
++#define CLIC_INTATTR_MMODE_EDGE  0xC2U
++#define CLIC_INTCTL_MAX          0xFFU
++
++static void __iomem *clic_base;
++static void __iomem *clic_intmtx_base;
++
++static u8 clic_intmtx_source[CLIC_NUM_IRQS];
++static u8 clic_trig_edge[CLIC_NUM_IRQS];
++
++struct irq_domain *esp32p4_clic_domain;
++EXPORT_SYMBOL_GPL(esp32p4_clic_domain);
++
++static void clic_irq_mask(struct irq_data *d)
++{
++	writeb(0, clic_base + d->hwirq * 4 + CLIC_INTIE_OFF);
++}
++
++static void clic_irq_unmask(struct irq_data *d)
++{
++	writeb(1, clic_base + d->hwirq * 4 + CLIC_INTIE_OFF);
++}
++
++static void clic_irq_ack(struct irq_data *d)
++{
++	/*
++	 * Per CLIC spec, INTIP on a level-triggered slot mirrors the source
++	 * line: software writes are nominally no-ops. In practice we've seen
++	 * non-deterministic TX stalls on UART0 (level-mode) that are consistent
++	 * with the write-0 here disturbing a pending latch when the sequence
++	 * is: mask_ack (this write, source still high) → handler clears
++	 * source in peripheral → unmask. Gate the write on edge-mode only,
++	 * which is all the CLIC spec actually requires it for.
++	 */
++	if (clic_trig_edge[d->hwirq])
++		writeb(0, clic_base + d->hwirq * 4 + CLIC_INTIP_OFF);
++}
++
++static int clic_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	u8 attr;
++
++	switch (type) {
++	case IRQ_TYPE_EDGE_RISING:
++		attr = CLIC_INTATTR_MMODE_EDGE;
++		clic_trig_edge[d->hwirq] = 1;
++		break;
++	case IRQ_TYPE_LEVEL_HIGH:
++	case IRQ_TYPE_NONE:
++	default:
++		attr = CLIC_INTATTR_MMODE_LEVEL;
++		clic_trig_edge[d->hwirq] = 0;
++		break;
++	}
++	writeb(attr, clic_base + d->hwirq * 4 + CLIC_INTATTR_OFF);
++	return 0;
++}
++
++static struct irq_chip esp32p4_clic_chip = {
++	.name          = "ESP32P4-CLIC",
++	.irq_mask      = clic_irq_mask,
++	.irq_unmask    = clic_irq_unmask,
++	.irq_ack       = clic_irq_ack,
++	.irq_set_type  = clic_irq_set_type,
++};
++
++static int clic_domain_map(struct irq_domain *d, unsigned int irq,
++			    irq_hw_number_t hwirq)
++{
++	u8 attr;
++	irq_flow_handler_t handler;
++
++	if (clic_intmtx_base && clic_intmtx_source[hwirq])
++		writel(hwirq, clic_intmtx_base + clic_intmtx_source[hwirq] * 4);
++
++	if (clic_trig_edge[hwirq]) {
++		attr = CLIC_INTATTR_MMODE_EDGE;
++		handler = handle_edge_irq;
++	} else {
++		attr = CLIC_INTATTR_MMODE_LEVEL;
++		handler = handle_level_irq;
++	}
++
++	writeb(attr,             clic_base + hwirq * 4 + CLIC_INTATTR_OFF);
++	writeb(CLIC_INTCTL_MAX,  clic_base + hwirq * 4 + CLIC_INTCTL_OFF);
++
++	irq_domain_set_info(d, irq, hwirq, &esp32p4_clic_chip, NULL,
++			    handler, NULL, NULL);
++	return 0;
++}
++
++static int clic_domain_xlate(struct irq_domain *d, struct device_node *controller,
++			      const u32 *intspec, unsigned int intsize,
++			      unsigned long *out_hwirq, unsigned int *out_type)
++{
++	if (intsize < 1 || intspec[0] >= CLIC_NUM_IRQS)
++		return -EINVAL;
++	*out_hwirq = intspec[0];
++	*out_type  = (intsize >= 3) ? intspec[2] : IRQ_TYPE_LEVEL_HIGH;
++
++	if (intsize >= 2)
++		clic_intmtx_source[intspec[0]] = (u8)intspec[1];
++	if (intsize >= 3)
++		clic_trig_edge[intspec[0]] =
++			(intspec[2] == IRQ_TYPE_EDGE_RISING) ? 1 : 0;
++	else
++		clic_trig_edge[intspec[0]] = 0;
++
++	return 0;
++}
++
++static const struct irq_domain_ops clic_domain_ops = {
++	.map    = clic_domain_map,
++	.xlate  = clic_domain_xlate,
++};
++
++static int __init esp32p4_clic_init(struct device_node *np,
++				     struct device_node *parent)
++{
++	clic_base = of_iomap(np, 0);
++	if (!clic_base) {
++		pr_err("cannot map CLIC registers\n");
++		return -ENOMEM;
++	}
++
++	clic_intmtx_base = of_iomap(np, 1);
++
++	esp32p4_clic_domain = irq_domain_add_linear(np, CLIC_NUM_IRQS,
++						     &clic_domain_ops, NULL);
++	if (!esp32p4_clic_domain) {
++		iounmap(clic_base);
++		if (clic_intmtx_base)
++			iounmap(clic_intmtx_base);
++		pr_err("cannot allocate IRQ domain\n");
++		return -ENOMEM;
++	}
++
++	pr_info("%d IRQ slots%s\n", CLIC_NUM_IRQS,
++		clic_intmtx_base ? ", INTMTX routing enabled" : "");
++	return 0;
++}
++
++IRQCHIP_DECLARE(esp32p4_clic, "espressif,esp32p4-clic", esp32p4_clic_init);
+--- a/drivers/irqchip/irq-riscv-intc.c	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/irqchip/irq-riscv-intc.c	2026-05-05 11:14:25.078204319 +0200
+@@ -26,10 +26,37 @@
+ static unsigned int riscv_intc_custom_base __ro_after_init = BITS_PER_LONG;
+ static unsigned int riscv_intc_custom_nr_irqs __ro_after_init;
+ 
++#ifdef CONFIG_SOC_ESP32P4
++extern struct irq_domain *esp32p4_clic_domain;
++#endif
++
+ static void riscv_intc_irq(struct pt_regs *regs)
+ {
+ 	unsigned long cause = regs->cause & ~CAUSE_IRQ_FLAG;
+ 
++#ifdef CONFIG_SOC_ESP32P4
++	/*
++	 * In CLIC mode, mcause packs interrupt level into bits[29:27]
++	 * (NLBITS=3) alongside the interrupt ID in bits[7:0].  Strip the
++	 * level bits to get the plain slot ID before dispatching.
++	 * External slots (ID >= 16) go via the CLIC domain; 0-15 fall
++	 * through to the standard INTC domain below.
++	 */
++	{
++		unsigned long clic_id = cause & 0xFF;
++
++		if (clic_id >= 16) {
++			if (esp32p4_clic_domain &&
++			    !generic_handle_domain_irq(esp32p4_clic_domain, clic_id))
++				return;
++			pr_warn_ratelimited("Unhandled CLIC irq (id=%ld cause=0x%lx)\n",
++					    clic_id, cause);
++			return;
++		}
++		cause = clic_id;
++	}
++#endif
++
+ 	if (generic_handle_domain_irq(intc_domain, cause))
+ 		pr_warn_ratelimited("Failed to handle interrupt (cause: %ld)\n", cause);
+ }
+--- a/drivers/tty/serial/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/tty/serial/Kconfig	2026-05-05 11:14:25.078357903 +0200
+@@ -1595,7 +1595,7 @@
+ 
+ config SERIAL_ESP32
+ 	tristate "Espressif ESP32 UART support"
+-	depends on XTENSA_PLATFORM_ESP32 || (COMPILE_TEST && OF)
++	depends on XTENSA_PLATFORM_ESP32 || ARCH_ESPRESSIF || (COMPILE_TEST && OF)
+ 	select SERIAL_CORE
+ 	select SERIAL_CORE_CONSOLE
+ 	select SERIAL_EARLYCON
+@@ -1603,6 +1603,7 @@
+ 	  Driver for the UART controllers of the Espressif ESP32xx SoCs.
+ 	  When earlycon option is enabled the following kernel command line
+ 	  snippets may be used:
++	    earlycon=esp32p4uart,mmio32,0x500ca000,115200n8
+ 	    earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000
+ 	    earlycon=esp32uart,mmio32,0x3ff40000,115200n8
+ 
+--- a/drivers/tty/serial/esp32_uart.c	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/tty/serial/esp32_uart.c	2026-05-05 11:14:25.078535570 +0200
+@@ -123,6 +123,21 @@
+ 	.has_clkconf = true,
+ };
+ 
++/*
++ * ESP32-P4 (hw_ver1): same TXFIFO/RXFIFO field positions as ESP32 (bits[23:16]
++ * and bits[7:0] respectively), but 12-bit clkdiv like ESP32S3, and has
++ * clk_conf register.
++ */
++static const struct esp32_uart_variant esp32p4_variant = {
++	.clkdiv_mask = ESP32S3_UART_CLKDIV,
++	.rxfifo_cnt_mask = ESP32_UART_RXFIFO_CNT,
++	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
++	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
++	.rx_flow_en = ESP32_UART_RX_FLOW_EN,
++	.type = "ESP32-P4 UART",
++	.has_clkconf = true,
++};
++
+ static const struct of_device_id esp32_uart_dt_ids[] = {
+ 	{
+ 		.compatible = "esp,esp32-uart",
+@@ -130,6 +145,9 @@
+ 	}, {
+ 		.compatible = "esp,esp32s3-uart",
+ 		.data = &esp32s3_variant,
++	}, {
++		.compatible = "esp,esp32p4-uart",
++		.data = &esp32p4_variant,
+ 	}, { /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, esp32_uart_dt_ids);
+@@ -267,6 +285,7 @@
+ 	u32 tx_fifo_used = esp32_uart_tx_fifo_cnt(port);
+ 	unsigned int pending;
+ 	u8 ch;
++	u32 int_ena;
+ 
+ 	if (tx_fifo_used >= ESP32_UART_TX_FIFO_SIZE)
+ 		return;
+@@ -275,12 +294,38 @@
+ 				       ESP32_UART_TX_FIFO_SIZE - tx_fifo_used,
+ 				       true, esp32_uart_put_char(port, ch),
+ 				       ({}));
++	int_ena = esp32_uart_read(port, UART_INT_ENA_REG);
+ 	if (pending) {
+-		u32 int_ena;
+-
+-		int_ena = esp32_uart_read(port, UART_INT_ENA_REG);
++		/*
++		 * CLIC slot is edge-triggered on INT_ST 0->1. Clear any
++		 * stale INT_ST.TXFIFO_EMPTY before (re)enabling so the next
++		 * time the hardware condition asserts we get a fresh rising
++		 * edge. Without this, if TXFIFO_EMPTY happens to already be
++		 * latched at the moment we unmask, no edge is generated and
++		 * the IRQ never fires — TX stalls indefinitely.
++		 */
++		esp32_uart_write(port, UART_INT_CLR_REG, UART_TXFIFO_EMPTY_INT);
+ 		int_ena |= UART_TXFIFO_EMPTY_INT;
+-		esp32_uart_write(port, UART_INT_ENA_REG, int_ena);
++	} else {
++		int_ena &= ~UART_TXFIFO_EMPTY_INT;
++	}
++	esp32_uart_write(port, UART_INT_ENA_REG, int_ena);
++
++	/*
++	 * Race: between our INT_CLR above and our INT_ENA write, the FIFO
++	 * may have drained past threshold, causing INT_ST to set (and, if
++	 * the threshold was crossed just after INT_CLR, no IRQ since ENA
++	 * was off). After enabling, if INT_ST already reflects the
++	 * condition, check once more and re-clear — that clear combined
++	 * with the still-true hardware condition will reassert INT_ST and
++	 * produce an edge visible to CLIC (INT_ST is 0->1 on hw-sticky
++	 * reassertion after clear).
++	 */
++	if (pending) {
++		u32 st = esp32_uart_read(port, UART_INT_ST_REG);
++		if (st & UART_TXFIFO_EMPTY_INT)
++			esp32_uart_write(port, UART_INT_CLR_REG,
++					 UART_TXFIFO_EMPTY_INT);
+ 	}
+ }
+ 
+@@ -292,18 +337,51 @@
+ static irqreturn_t esp32_uart_int(int irq, void *dev_id)
+ {
+ 	struct uart_port *port = dev_id;
++	unsigned long flags;
+ 	u32 status;
++	u32 ena;
+ 
+-	status = esp32_uart_read(port, UART_INT_ST_REG);
++	ena = esp32_uart_read(port, UART_INT_ENA_REG);
+ 
+-	if (status & (UART_RXFIFO_FULL_INT | UART_BRK_DET_INT))
+-		esp32_uart_rxint(port);
+-	if (status & UART_TXFIFO_EMPTY_INT)
+-		esp32_uart_txint(port);
++	/*
++	 * CLIC slot is edge-triggered on INT_ST 0->1. RXFIFO_FULL_INT is
++	 * level-derived (stays high while count >= threshold), so we must
++	 * fully drain the FIFO before clearing, otherwise the INT_ST bit
++	 * will not drop to 0 and no fresh rising edge will ever present to
++	 * the CLIC. After clearing, re-read INT_ST to catch bytes that
++	 * arrived mid-handler — if any level-derived flag is still set, we
++	 * loop. This yields a synthetic re-entry that keeps RX flowing for
++	 * bursty input faster than we can handle one IRQ at a time.
++	 */
++	do {
++		u32 handled;
++
++		status = esp32_uart_read(port, UART_INT_ST_REG) & ena;
++		if (!status)
++			break;
++
++		if (status & (UART_RXFIFO_FULL_INT | UART_BRK_DET_INT))
++			esp32_uart_rxint(port);
++
++		if (status & UART_TXFIFO_EMPTY_INT) {
++			spin_lock_irqsave(&port->lock, flags);
++			esp32_uart_txint(port);
++			spin_unlock_irqrestore(&port->lock, flags);
++		}
+ 
+-	esp32_uart_write(port, UART_INT_CLR_REG, status);
++		/*
++		 * TXFIFO_EMPTY is managed exclusively by transmit_buffer:
++		 * it already performed an INT_CLR → INT_ENA → post-arm INT_ST
++		 * re-check sequence specifically to leave a fresh edge visible
++		 * to the CLIC. Clearing TXFIFO_EMPTY here would clobber that
++		 * arming and can lose the next IRQ entirely, stalling TX.
++		 */
++		handled = status & ~UART_TXFIFO_EMPTY_INT;
++		if (handled)
++			esp32_uart_write(port, UART_INT_CLR_REG, handled);
++	} while (1);
+ 
+-	return IRQ_RETVAL(status);
++	return IRQ_HANDLED;
+ }
+ 
+ static void esp32_uart_start_tx(struct uart_port *port)
+@@ -668,6 +746,17 @@
+ OF_EARLYCON_DECLARE(esp32s3uart, "esp,esp32s3-uart",
+ 		    esp32s3_uart_early_console_setup);
+ 
++static int __init esp32p4_uart_early_console_setup(struct earlycon_device *device,
++						   const char *options)
++{
++	device->port.private_data = (void *)&esp32p4_variant;
++
++	return esp32xx_uart_early_console_setup(device, options);
++}
++
++OF_EARLYCON_DECLARE(esp32p4uart, "esp,esp32p4-uart",
++		    esp32p4_uart_early_console_setup);
++
+ static struct uart_driver esp32_uart_reg = {
+ 	.owner		= THIS_MODULE,
+ 	.driver_name	= DRIVER_NAME,
+--- a/kernel/sched/idle.c	2026-04-30 11:13:53.000000000 +0200
++++ b/kernel/sched/idle.c	2026-05-05 11:14:25.078699988 +0200
+@@ -63,8 +63,9 @@
+ 
+ 	raw_local_irq_enable();
+ 	while (!tif_need_resched() &&
+-	       (cpu_idle_force_poll || tick_check_broadcast_expired()))
++	       (cpu_idle_force_poll || tick_check_broadcast_expired())) {
+ 		cpu_relax();
++	}
+ 	raw_local_irq_disable();
+ 
+ 	ct_cpuidle_exit();

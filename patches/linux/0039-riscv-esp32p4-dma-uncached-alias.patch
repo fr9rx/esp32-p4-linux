@@ -1,0 +1,137 @@
+riscv: esp32p4: coherent DMA through the non-cacheable alias
+
+dma_alloc_coherent() could not succeed on this platform, and the kernel said
+so at every boot:
+
+  coherent DMA allocations not supported on this platform.
+  dw_mmc 50083000.mmc: IDMAC: cached descriptor ring with manual cache sync
+
+NOMMU has no second mapping available to mark uncached, so dma_direct_alloc()
+found neither ARCH_HAS_DMA_SET_UNCACHED nor DMA_DIRECT_REMAP nor a global
+pool and returned NULL. Drivers then had two options, both bad: fail, or
+open-code a cached descriptor ring with hand-written cache maintenance.
+dw_mmc took the second (0007) and getting the maintenance subtly wrong is
+what made the SD card unusable until 0036. stmmac cannot take it at all --
+it allocates its rings in ndo_open and simply refuses to come up:
+
+  stmmaceth 50098000.ethernet eth0: stmmac_setup_dma_desc: DMA descriptors
+  allocation failed
+
+There is a third option, and it was in the SoC all along. The ESP32-P4
+aliases memory *behind* its cache at a fixed +0x40000000, for both PSRAM and
+internal SRAM. ESP-IDF names the constants and says what they are:
+
+  /* non-cacheable offset for memory behind the cache */
+  #define SOC_NON_CACHEABLE_OFFSET_SRAM   0x40000000
+  #define SOC_NON_CACHEABLE_OFFSET_PSRAM  0x40000000
+
+So the platform can implement arch_dma_set_uncached() the way MIPS does with
+UNCAC_BASE: allocate an ordinary page, hand the CPU the aliased address, hand
+the device the real one. dma_direct_alloc() already calls
+arch_dma_prep_coherent() first, which on riscv evicts dirty lines through the
+cached alias, so the handover is clean.
+
+VERIFIED ON HARDWARE
+
+An assumption this load-bearing should not be taken from a header comment,
+and it cannot be tested from Linux -- /dev/mem refuses anything past
+high_memory, so reading 0x88000000 returns EFAULT from
+valid_phys_addr_range() before it ever reaches the bus. The bootloader tests
+it in M-mode instead (p4_psram_alias_test): write through the alias, read
+back through the cached window, then write a *different* value through the
+cached window and read the alias again with no cache maintenance between.
+
+  p4boot: psram alias 0x88100000: cached-sees-alias 0x11111111,
+          alias-sees-cached 0x11111111, alias-rw 0x33333333
+  p4boot: psram alias: UNCACHED and coherent -- dma_alloc_coherent() can work
+
+The middle number is the proof: the cached write of 0x22222222 was invisible
+through the alias, so it was still sitting in the cache and the alias is
+genuinely not going through it.
+
+WHAT THIS REPLACES
+
+An earlier attempt used DMA_GLOBAL_POOL with a shared-dma-pool in internal
+SRAM, on the belief that internal SRAM is uncached on this part. It is not:
+CACHE_LL_LEVEL_INT_MEM is 1 on the P4, meaning internal memory is cached by
+L1, and esp_cache_get_line_size_by_addr() accordingly returns 64 for it
+rather than 0. The pool came up correctly and then broke the SD card, with
+0036's diagnostic firing intermittently after transfers had already worked --
+the signature of a stale cache line. That patch is dropped; the two cannot
+coexist anyway, since kernel/dma/Kconfig has
+`depends on !ARCH_HAS_DMA_SET_UNCACHED` on DMA_GLOBAL_POOL.
+
+ARCH_HAS_DMA_CLEAR_UNCACHED is deliberately NOT selected. The alias is an
+address, not a mapping, so there is nothing to undo, and dma_direct_free()
+recovers the page from the DMA address rather than from the CPU pointer.
+
+Signed-off-by: f23 <ali@connectedmotion.io>
+diff -urN a/arch/riscv/Kconfig.socs b/arch/riscv/Kconfig.socs
+--- a/arch/riscv/Kconfig.socs	2026-09-10 19:39:52.517672859 +0300
++++ b/arch/riscv/Kconfig.socs	2026-09-10 19:39:52.853672974 +0300
+@@ -109,6 +109,10 @@
+ 	select RISCV_DMA_NONCOHERENT
+ 	select RISCV_NONSTANDARD_CACHE_OPS
+ 	select NOMMU_USERSPACE_POOL
++	# This SoC aliases both PSRAM and internal SRAM uncached at
++	# +0x40000000, so dma_alloc_coherent() can return memory that really
++	# is coherent instead of failing. See arch/riscv/mm/dma-noncoherent.c.
++	select ARCH_HAS_DMA_SET_UNCACHED
+ 	help
+ 	  This enables support for the Espressif ESP32-P4 SoC.
+ 	  The ESP32-P4 features dual RV32IMAFC HP cores, LP core,
+diff -urN a/arch/riscv/mm/dma-noncoherent.c b/arch/riscv/mm/dma-noncoherent.c
+--- a/arch/riscv/mm/dma-noncoherent.c	2026-06-09 13:28:53.000000000 +0300
++++ b/arch/riscv/mm/dma-noncoherent.c	2026-09-10 19:39:52.853672974 +0300
+@@ -155,3 +155,51 @@
+ 	if (!noncoherent_supported)
+ 		dma_cache_alignment = 1;
+ }
++
++#ifdef CONFIG_SOC_ESP32P4
++/*
++ * The ESP32-P4 aliases memory behind its cache at a fixed +0x40000000, for
++ * both PSRAM and internal SRAM -- ESP-IDF calls the constants
++ * SOC_NON_CACHEABLE_OFFSET_PSRAM and SOC_NON_CACHEABLE_OFFSET_SRAM and
++ * comments them "non-cacheable offset for memory behind the cache".
++ *
++ * That is what makes dma_alloc_coherent() possible here. NOMMU has no second
++ * mapping to mark uncached, so without this dma_direct_alloc() gives up:
++ *
++ *   coherent DMA allocations not supported on this platform.
++ *
++ * and every driver with a descriptor ring either fails to open or open-codes
++ * a cached ring plus hand-written cache maintenance. That was the road that
++ * made the SD card unusable, and stmmac cannot take it at all.
++ *
++ * dma_direct_alloc() does the rest: it allocates an ordinary page, calls
++ * arch_dma_prep_coherent() to evict any dirty lines through the cached alias,
++ * hands the CPU the pointer this returns, and hands the device
++ * page_to_phys() -- the real address. The device is unaffected; only the
++ * CPU's route to the memory changes.
++ *
++ * VERIFIED ON HARDWARE, because an assumption this load-bearing should not be
++ * taken from a header comment. The bootloader writes a value through the
++ * alias, reads it back through the cached window, then writes a different
++ * value through the cached window and reads the alias again with no cache
++ * maintenance in between:
++ *
++ *   p4boot: psram alias 0x88100000: cached-sees-alias 0x11111111,
++ *           alias-sees-cached 0x11111111, alias-rw 0x33333333
++ *
++ * The middle number is the proof. The cached write of 0x22222222 was
++ * invisible through the alias, so it was still sitting in the cache and the
++ * alias is genuinely not going through it. See p4_psram_alias_test().
++ *
++ * No arch_dma_clear_uncached(): the alias is an address, not a mapping, so
++ * there is nothing to undo, and dma_direct_free() finds the page from the DMA
++ * address rather than from the CPU pointer. ARCH_HAS_DMA_CLEAR_UNCACHED is
++ * deliberately not selected.
++ */
++#define ESP32P4_NONCACHEABLE_OFFSET	0x40000000UL
++
++void *arch_dma_set_uncached(void *addr, size_t size)
++{
++	return (void *)((unsigned long)addr + ESP32P4_NONCACHEABLE_OFFSET);
++}
++#endif /* CONFIG_SOC_ESP32P4 */

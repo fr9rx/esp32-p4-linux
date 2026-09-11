@@ -1,0 +1,169 @@
+mmc: dw_mmc: keep a cached IDMAC descriptor ring coherent
+
+dw_mci_prepare_desc32() polls the descriptor OWN bit before reusing a
+descriptor, to be sure IDMAC has finished with it:
+
+	if (readl_poll_timeout_atomic(&desc->des0, val,
+				      IDMAC_OWN_CLR64(val),
+				      10, 100 * USEC_PER_MSEC))
+		goto err_own_bit;
+
+That is a plain load, which is correct only because the ring normally comes
+from dma_alloc_coherent() and is therefore uncached.
+
+On this platform it is not. NOMMU means there is no second mapping available
+to mark uncached, dma_alloc_coherent() fails, and the fallback added by
+0007-mmc-dw_mmc-esp32p4-fixes.patch allocates the ring with devm_kzalloc() --
+ordinary cached PSRAM. The boot log says so:
+
+  dw_mmc 50083000.mmc: IDMAC: cached descriptor ring with manual cache sync
+
+0007 writes the ring back before each transfer, so IDMAC does see the
+descriptors. It never invalidates, so the CPU never sees IDMAC. The poll
+above reads the clean, resident, stale line it wrote itself -- OWN still set
+-- spins the full 100 ms, and fails the transfer with -EINVAL.
+
+Symptoms this produces, all of which were observed on an ESP32-P4:
+
+  - one large transfer looks fine. err_own_bit reinitialises the ring, so the
+    retry finds OWN clear and succeeds. `dd bs=1M` of a whole MiB works.
+  - the many small scattered requests a filesystem generates do not. Reading
+    any subdirectory of a mounted ext2 never returns.
+  - freshly written sectors read back holding stale buffer contents, from
+    descriptors whose DMA never ran.
+
+Fix the direction that was missing. Invalidate the ring before the OWN-bit
+polls, and write it back at the end of dw_mci_idmac_init() so the chain
+pointers reach memory and every line is left clean -- which is what makes the
+whole-ring invalidate lossless. Both are gated on a new sg_cpu_cached flag,
+so platforms with a real coherent allocation are untouched.
+
+Also promote the descriptor-timeout dev_dbg() to a ratelimited dev_warn():
+if this ever regresses it should be visible rather than merely slow.
+
+Signed-off-by: f23 <ali@connectedmotion.io>
+diff -urN a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c	2026-09-08 22:50:42.622607566 +0300
++++ b/drivers/mmc/host/dw_mmc.c	2026-09-09 22:30:09.272203323 +0300
+@@ -513,6 +513,39 @@
+ 	}
+ }
+ 
++/*
++ * Cache maintenance for an IDMAC descriptor ring that lives in cached memory.
++ *
++ * dma_alloc_coherent() cannot hand out uncached memory on a NOMMU platform:
++ * there is no second mapping to mark uncached, so dw_mci_init_dma() falls back
++ * to plain pages and sets sg_cpu_cached. Two directions then need maintenance,
++ * and the second is the one that is easy to miss:
++ *
++ *   - before IDMAC reads the descriptors we wrote     -> writeback
++ *   - before *we* read a descriptor that IDMAC wrote  -> invalidate
++ *
++ * That read is dw_mci_prepare_desc32()'s OWN-bit poll. Upstream assumes
++ * coherent memory there and uses a plain load, so on a cached ring the poll
++ * keeps seeing the line the CPU wrote itself, never observes IDMAC clearing
++ * OWN, and burns its full 100 ms timeout per descriptor before failing the
++ * transfer. One large transfer survives that -- the error path reinitialises
++ * the ring, so the retry finds OWN clear -- which is why raw dd looked fine
++ * while the many small requests a filesystem generates did not.
++ */
++static void dw_mci_desc_sync_for_cpu(struct dw_mci *host)
++{
++	if (host->sg_cpu_cached)
++		dma_sync_single_for_cpu(host->dev, host->sg_dma,
++					DESC_RING_BUF_SZ, DMA_FROM_DEVICE);
++}
++
++static void dw_mci_desc_sync_for_device(struct dw_mci *host)
++{
++	if (host->sg_cpu_cached)
++		dma_sync_single_for_device(host->dev, host->sg_dma,
++					   DESC_RING_BUF_SZ, DMA_TO_DEVICE);
++}
++
+ static int dw_mci_idmac_init(struct dw_mci *host)
+ {
+ 	int i;
+@@ -566,6 +599,14 @@
+ 		p->des0 = cpu_to_le32(IDMAC_DES0_ER);
+ 	}
+ 
++	/*
++	 * The chain pointers just written have to reach memory before IDMAC
++	 * is pointed at the ring below. This also leaves every line clean,
++	 * which is what makes the whole-ring invalidate in
++	 * dw_mci_prepare_desc32() lossless.
++	 */
++	dw_mci_desc_sync_for_device(host);
++
+ 	dw_mci_idmac_reset(host);
+ 
+ 	if (host->dma_64bit_address == 1) {
+@@ -602,6 +643,15 @@
+ 
+ 	desc_first = desc_last = desc = host->sg_cpu;
+ 
++	/*
++	 * Invalidate any cached copy of the ring so the OWN-bit polls below
++	 * read what IDMAC wrote rather than what we wrote. Invalidating the
++	 * whole ring is safe here: it was written back before the previous
++	 * transfer started, and nothing in this pass has touched it yet.
++	 */
++	dw_mci_desc_sync_for_cpu(host);
++
++
+ 	for (i = 0; i < sg_len; i++) {
+ 		unsigned int length = sg_dma_len(&data->sg[i]);
+ 
+@@ -674,6 +724,15 @@
+ 
+ 	desc_first = desc_last = desc = host->sg_cpu;
+ 
++	/*
++	 * Invalidate any cached copy of the ring so the OWN-bit polls below
++	 * read what IDMAC wrote rather than what we wrote. Invalidating the
++	 * whole ring is safe here: it was written back before the previous
++	 * transfer started, and nothing in this pass has touched it yet.
++	 */
++	dw_mci_desc_sync_for_cpu(host);
++
++
+ 	for (i = 0; i < sg_len; i++) {
+ 		unsigned int length = sg_dma_len(&data->sg[i]);
+ 
+@@ -730,7 +789,8 @@
+ 	return 0;
+ err_own_bit:
+ 	/* restore the descriptor chain as it's polluted */
+-	dev_dbg(host->dev, "descriptor is still owned by IDMAC.\n");
++	dev_warn_ratelimited(host->dev,
++			     "IDMAC descriptor still owned after 100 ms; transfer dropped\n");
+ 	memset(host->sg_cpu, 0, DESC_RING_BUF_SZ);
+ 	dw_mci_idmac_init(host);
+ 	return -EINVAL;
+@@ -3212,6 +3272,7 @@
+ 				 * Revisit if an IOMMU layer ever appears on this SoC.
+ 				 */
+ 				host->sg_dma = virt_to_phys(host->sg_cpu);
++				host->sg_cpu_cached = true;
+ 				dev_info(host->dev,
+ 					 "IDMAC: cached descriptor ring with manual cache sync\n");
+ 			}
+diff -urN a/drivers/mmc/host/dw_mmc.h b/drivers/mmc/host/dw_mmc.h
+--- a/drivers/mmc/host/dw_mmc.h	2026-06-09 13:28:53.000000000 +0300
++++ b/drivers/mmc/host/dw_mmc.h	2026-09-09 22:30:09.200203340 +0300
+@@ -182,6 +182,13 @@
+ 
+ 	dma_addr_t		sg_dma;
+ 	void			*sg_cpu;
++	/*
++	 * Set when sg_cpu is plain cached memory rather than the uncached
++	 * mapping dma_alloc_coherent() normally supplies -- see the
++	 * fallback in dw_mci_init_dma(). The descriptor ring then needs
++	 * explicit cache maintenance in both directions.
++	 */
++	bool			sg_cpu_cached;
+ 	const struct dw_mci_dma_ops	*dma_ops;
+ 	/* For idmac */
+ 	unsigned int		ring_size;

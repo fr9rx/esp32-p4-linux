@@ -1,0 +1,119 @@
+--- a/drivers/mmc/host/dw_mmc.c	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/mmc/host/dw_mmc.c	2026-05-05 11:14:25.115614684 +0200
+@@ -236,6 +236,16 @@
+ 	struct dw_mci *host = slot->host;
+ 	unsigned int cmd_status = 0;
+ 
++	/*
++	 * SDMMC_CMD register has a 5-bit card_number field at bits [20:16]
++	 * that selects which physical slot the command targets. Mainline
++	 * dw_mmc was multi-slot historically but the loop was removed and
++	 * slot->id is hardcoded to 0; we read it from DT (`snps,slot-id`)
++	 * to restore support for boards that wire their card on a non-zero
++	 * physical slot. (The WHY2025 badge's own microSD is on slot 0.)
++	 */
++	cmd |= slot->id << 16;
++
+ 	mci_writel(host, CMDARG, arg);
+ 	wmb(); /* drain writebuffer */
+ 	dw_mci_wait_while_busy(host, cmd);
+@@ -314,6 +324,9 @@
+ 	if (!test_bit(DW_MMC_CARD_NO_USE_HOLD, &slot->flags))
+ 		cmdr |= SDMMC_CMD_USE_HOLD_REG;
+ 
++	/* CMD.card_number = slot->id; see comment in mci_send_cmd. */
++	cmdr |= slot->id << 16;
++
+ 	return cmdr;
+ }
+ 
+@@ -353,6 +366,9 @@
+ 	if (!test_bit(DW_MMC_CARD_NO_USE_HOLD, &host->slot->flags))
+ 		cmdr |= SDMMC_CMD_USE_HOLD_REG;
+ 
++	/* CMD.card_number = slot->id; see comment in mci_send_cmd. */
++	cmdr |= host->slot->id << 16;
++
+ 	return cmdr;
+ }
+ 
+@@ -733,6 +749,15 @@
+ 	if (ret)
+ 		goto out;
+ 
++	/*
++	 * Flush the descriptor ring out of the CPU cache so IDMAC sees the
++	 * descriptors we just wrote. No-op if sg_cpu came from
++	 * dma_alloc_coherent (already coherent); real cache writeback when
++	 * we fell back to plain pages on a NOMMU non-coherent platform.
++	 */
++	dma_sync_single_for_device(host->dev, host->sg_dma,
++				   DESC_RING_BUF_SZ, DMA_TO_DEVICE);
++
+ 	/* drain writebuffer */
+ 	wmb();
+ 
+@@ -1255,8 +1280,19 @@
+ 		/* inform CIU */
+ 		mci_send_cmd(slot, sdmmc_cmd_bits, 0);
+ 
+-		/* set clock to desired speed */
+-		mci_writel(host, CLKDIV, div);
++		/*
++		 * CLKDIV: bits [7:0] = slot 0 divider, [15:8] = slot 1, etc.
++		 * Read-modify-write to keep other slots' dividers intact and
++		 * place ours at the right byte for slot->id.
++		 */
++		{
++			u32 clkdiv = mci_readl(host, CLKDIV);
++			u32 shift  = slot->id * 8;
++
++			clkdiv &= ~(0xff << shift);
++			clkdiv |= (div & 0xff) << shift;
++			mci_writel(host, CLKDIV, clkdiv);
++		}
+ 
+ 		/* inform CIU */
+ 		mci_send_cmd(slot, sdmmc_cmd_bits, 0);
+@@ -3014,6 +3050,13 @@
+ 
+ 	slot = mmc_priv(mmc);
+ 	slot->id = 0;
++	/*
++	 * Allow boards that wire their card on a non-zero physical slot
++	 * to opt in via DT (`snps,slot-id`). Default 0 preserves mainline
++	 * behavior — the WHY2025 badge uses slot 0 for its microSD and
++	 * doesn't set this, so it's generic plumbing here, not badge-specific.
++	 */
++	of_property_read_u32(host->dev->of_node, "snps,slot-id", &slot->id);
+ 	slot->sdio_id = host->sdio_id0 + slot->id;
+ 	slot->mmc = mmc;
+ 	slot->host = host;
+@@ -3135,6 +3178,27 @@
+ 						   DESC_RING_BUF_SZ,
+ 						   &host->sg_dma, GFP_KERNEL);
+ 		if (!host->sg_cpu) {
++			/*
++			 * Coherent DMA alloc not available on this platform
++			 * (NOMMU, no uncached aperture). Fall back to plain
++			 * cached pages; we explicitly cache_writeback the
++			 * descriptor ring before each IDMAC kick — see
++			 * dw_mci_idmac_start_dma().
++			 */
++			host->sg_cpu = devm_kzalloc(host->dev,
++						    DESC_RING_BUF_SZ,
++						    GFP_KERNEL);
++			if (host->sg_cpu) {
++				/*
++				 * NOMMU + dma-direct: phys == dma_addr (1:1).
++				 * Revisit if an IOMMU layer ever appears on this SoC.
++				 */
++				host->sg_dma = virt_to_phys(host->sg_cpu);
++				dev_info(host->dev,
++					 "IDMAC: cached descriptor ring with manual cache sync\n");
++			}
++		}
++		if (!host->sg_cpu) {
+ 			dev_err(host->dev,
+ 				"%s: could not alloc DMA memory\n",
+ 				__func__);

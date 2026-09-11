@@ -1,0 +1,40 @@
+# Flash layout for native NOMMU Linux on the ESP32-P4.
+#
+# Source of truth for both sides: `make partitions.bin` turns this into the
+# 96-byte table at flash 0x8000, and the bootloader walks that table at step 7
+# rather than hardcoding offsets (p4/p4_flash.c).
+#
+# The bootloader itself (0x2000) and this table (0x8000) are NOT listed. Both
+# locations are fixed -- the ROM first-stage looks for us at 0x2000 and for the
+# table at 0x8000 -- and ESP-IDF's CSV format leaves both implicit.
+#
+# TYPES 0x40 AND 0x41, NOT `data` WITH A CUSTOM SUBTYPE. ESP-IDF reserves type
+# 0x00 for app and 0x01 for data, and leaves 0x40..0xFE for whatever system
+# owns the flash. A Linux kernel is neither an ESP-IDF app nor one of IDF's
+# data flavours, so a custom type is the correct encoding. (It is also the only
+# one that survives tooling: esp-idf-part panics on unknown data subtypes.)
+#
+# There is deliberately no app partition -- nothing downstream of us loads one.
+# The ~3.8 MB spare above dtb is where A/B kernel slots go later.
+#
+# The kernel partition is 12 MB, not the 6 MB it started as, and not the 10 MB
+# it was until 2026-09-09.
+#
+# Two kernels get flashed here at different times and the partition has to hold
+# the larger. images/Image is the SD-root build at 5.6 MB; images/Image.initramfs
+# carries the whole root filesystem as a built-in initramfs
+# (CONFIG_INITRAMFS_SOURCE) and is the one that provisions the card. When the
+# rootfs grew from 4.4 MB to 8.4 MB -- the tool set from the hypervisor image,
+# nano/less/grep/sed/xz/memtester and the rest -- the initramfs kernel went to
+# 10,332,036 bytes, which fits 10 MB (10,485,760) with 150 KB to spare. That is
+# not margin, that is luck, and the failure mode is a kernel silently truncated
+# by the flash tool. Flash is 16 MB and nothing else wants the space, so take
+# 12 MB and stop thinking about it.
+#
+# Growing this moves dtb, and that is safe: the bootloader walks this table at
+# step 7 rather than hardcoding offsets, so both sides move together as long as
+# partitions.bin is reflashed with the kernel (`make flash-all` does).
+#
+# Name,   Type, SubType, Offset,   Size
+kernel,   0x40, 0x00,    0x20000,  0xC00000
+dtb,      0x41, 0x00,    0xC20000, 0x10000

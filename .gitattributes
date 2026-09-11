@@ -1,0 +1,10 @@
+# Everything in this tree is built and run on Linux (or WSL). Checking it
+# out with CRLF endings breaks the shell scripts, the Makefiles and the
+# device-tree preprocessing, so normalise to LF in the working tree
+# regardless of the platform's autocrlf setting.
+* text=auto eol=lf
+
+# Binaries that must not be touched at all.
+*.bin  binary
+*.dtb  binary
+*.png  binary
