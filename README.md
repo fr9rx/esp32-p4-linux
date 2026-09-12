@@ -15,7 +15,8 @@ Linux owns the machine, in M-mode, on real hardware.
                       ESP32-P4 rev v1.0, HP core, M-mode, NOMMU
   flash (16 MB)         bootloader 0x2000 + table 0x8000
                         kernel 0x20000 (12 MB) + dtb 0xC20000 (64 KB)
-  PSRAM (32 MB)         kernel at 0x48000000, DTB at 0x49000000
+  PSRAM (32 MB)         HEX x16 DDR at 200 MHz, kernel at 0x48000000,
+                        DTB at 0x49000000
                         10 MB reserved at 0x49600000 for NOMMU user mmap
   microSD               ext4 root, journalled -- persistent, writable
   EMAC                  DesignWare GMAC, RMII -- DHCP, DNS, TCP, TLS
@@ -100,6 +101,7 @@ not have.
 | `tools/` | host-side scripts: device-tree build, card provisioning, serial helpers |
 | `docs/BUILD.md` | how to build it, and the four things that waste your time |
 | `docs/BOOTLOADER-LINK.md` | the exact IDF files to link, the two-function shim, and what's genuinely yours to write |
+| `docs/PSRAM-200MHZ.md` | how 32 MB of HEX PSRAM was brought up at 200 MHz with no ESP-IDF — the two bugs, every measurement, and the dead ends |
 | `docs/MULTICORE.md` | why the second HP core is unused, and what using it would cost |
 | `docs/HANDOFF.md`, `docs/NOTES.md` | carried over from the hypervisor line |
 | `docs/NATIVE-DRIVERS.md` | the earlier plan for replacing emulated devices — superseded by this repo, kept for the register-level findings |
@@ -273,8 +275,8 @@ Recorded here rather than left to be rediscovered:
   ESP-specific RMII clock divider on a speed change; `stmmac` knows nothing
   about it and the bootloader sets the 100 Mbit/s value once.
 - **`time` reports nonsense user time.** Real time is correct.
-- Bootloader step 12 (SD high speed), 200 MHz PSRAM, and warm-reset flash
-  instability are open. See the `docs/STATUS-*.md` series.
+- Bootloader step 12 (SD high speed) and warm-reset flash instability are
+  open. See the `docs/STATUS-*.md` series.
 
 ## Credits
 

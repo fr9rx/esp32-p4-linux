@@ -251,7 +251,7 @@ device.
 4. **LDO channel 4 → 3.3 V** for the microSD, via `PMU.ext_ldo[4]`
    (`PMU_EXT_LDO_P1_0P2A_REG` @ `PMU_BASE + 0x1d8`). Skip it and `dw_mmc`
    probes an empty slot: `rootwait` then hangs forever with no message.
-5. PSRAM up (32 MB HEX at 80 MHz), kernel at `0x48000000`, DTB at
+5. PSRAM up (32 MB HEX at 200 MHz), kernel at `0x48000000`, DTB at
    `0x48800000`, `a0` = hartid (0), `a1` = DTB physical address,
    `mstatus.MIE` clear, `fence.i` before the jump.
 6. Optionally **arm the MWDT** before jumping. Patch 0034 moves the kernel's
