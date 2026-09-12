@@ -79,6 +79,49 @@
  * this package has; esp_psram_impl_ap_hex.c is the driver that matches. */
 #define CONFIG_SPIRAM                           1
 
+/* HEX (x16) DDR mode. This one line is what makes 200 MHz work.
+ *
+ * It has exactly one consumer, and it does not look like much:
+ *
+ *     mspi_timing_tuning_configs.h:
+ *         #define MSPI_TIMING_PSRAM_DTR_MODE   CONFIG_SPIRAM_MODE_HEX
+ *
+ *     mspi_timing_tuning.c, s_select_best_tuning_config():
+ *         uint32_t best_point = 0;
+ *         ...
+ *     #if MSPI_TIMING_PSRAM_DTR_MODE
+ *         best_point = s_tuning_cfg_drv.psram_select_best_tuning_config(...);
+ *     #elif MSPI_TIMING_PSRAM_STR_MODE
+ *         best_point = ...
+ *     #endif
+ *         s_tuning_cfg_drv.psram_set_best_tuning_config(timing_config, best_point);
+ *
+ * Undefined in an #if is 0, silently, with no warning. So with this symbol
+ * missing BOTH branches vanish, `best_point` keeps its initialiser, and the
+ * tuning always selects config index 0 -- for the DQS phase pass and the
+ * delayline pass alike. The sweep still runs, still measures a perfectly
+ * good eye, still prints it, and then throws the answer away.
+ *
+ * Measured here at 200 MHz, delayline id against bytes wrong out of 128,
+ * phase 67.5 degrees:
+ *
+ *     id     0   1   2   3   4 ... 27   28  29  30
+ *     bad   81  56  18   5   0 ...  0   17  34  65
+ *              ^^ index 0, what was actually being used
+ *                          ^^^^^^^^^^ the eye the sweep found and discarded
+ *
+ * At 80 MHz index 0 lands inside the eye, so the bug is invisible: PSRAM
+ * works, the walking-address test passes over all 32 MB, and nothing
+ * suggests the tuning result is being ignored. At 200 MHz index 0 is just
+ * outside it, and the symptom is reads shifted two bytes late -- one DDR
+ * beat on a x16 bus -- which reads exactly like a read-latency problem and
+ * sent me through dummy-cycle sweeps of both MSPI controllers first.
+ *
+ * It is a real IDF Kconfig symbol (SPIRAM_MODE_HEX), not an invention; a
+ * full IDF build for this part defines it. The bootloader's hand-written
+ * sdkconfig.h simply never had it. */
+#define CONFIG_SPIRAM_MODE_HEX                  1
+
 /* CONFIG_SPIRAM_USE_8LINE_MODE is deliberately NOT defined.
  *
  * The name reads like "this is an 8-line part", but it is not a description --
@@ -94,56 +137,45 @@
  * skewed -- because half the data lanes were not being used. That looks
  * identical to a signal-integrity failure, and I misread it as one. */
 
-/* 80 MHz. IDF defaults this part to 200 MHz; 200 does not work HERE YET, and
- * the reason is still open. Recorded properly because the symptom is precise
- * and someone (possibly future me) should be able to pick this up cold.
+/* 200 MHz, which is also what IDF defaults this part to. MPLL runs at 400
+ * and the bus divider is 2 (AP_HEX_PSRAM_MPLL_DEFAULT_FREQ_MHZ is 400 for
+ * 200M, 320 for 80M, and the divider is that over CONFIG_SPIRAM_SPEED).
  *
- * WHAT 200 MHz DOES: everything except read correctly. MPLL comes up at 400,
- * the chip trains, tuning completes, and it identifies itself perfectly --
- * AP Memory gen 4, 256 Mbit, good-die Pass, and it accepts the 200 MHz
- * setting (Readlatency 0x04 = 14 cycles @ Fixed). Then reads through the
- * mapped window come back offset by exactly 8 bytes:
+ * This used to be 80 MHz, with a long note saying 200 did not work and the
+ * reason was open. It was two bugs on top of each other, and neither was in
+ * the chip or the board:
  *
- *     read(0x48000008) == what was written to 0x48000000
- *     read(0x4800000c) == what was written to 0x48000004
- *     ... 100% of 8388608 words
+ *   1. CONFIG_SPIRAM_MODE_HEX was not defined, so the DQS tuning discarded
+ *      its own result and always used config index 0. See the block above.
  *
- * Eight bytes is four beats on a 16-bit DDR bus: a read-latency mismatch on
- * the cache/AXI path, not noise and not marginal signal integrity. Note the
- * tuning tunes MSPI_ID_3 (manual transactions) while the mapped window uses
- * MSPI_ID_2, and the suspicion is that the tuned dummy-cycle result is not
- * reaching ID_2 in our reduced environment.
+ *   2. Nothing may write a BURST to PSRAM while the core is still at 40 MHz.
+ *      The bootloader used to run its walking-address test before raising
+ *      the CPU, deliberately, so that train-map-verify all happened at one
+ *      clock. At 200 MHz that first burst wedges the write channel for the
+ *      rest of the boot. main.c has the measurements; the raise now happens
+ *      between training and the test.
  *
- * RULED OUT along the way, each verified on hardware:
- *   - CONFIG_SPIRAM_USE_8LINE_MODE was wrongly set (a real bug, now fixed --
- *     it forced a 16-line part onto 8 lanes). Fixing it changed the symptom
- *     but not the outcome.
- *   - CPU clock: fails identically with the core left at 40 MHz.
- *   - Ordering: fails whether PSRAM comes before or after the CPU raise.
- *     (IDF's order is PSRAM first -- cpu_start.c:645 vs 830 -- and we now
- *     match it regardless, because it is the proven one.)
- *   - Stale cache lines over the remapped window: invalidating after the map
- *     is correct and now done, but was not the cause.
+ * Each bug alone produced total corruption, so fixing either one on its own
+ * looked like no progress at all -- which is most of why this took so long.
  *
- * NOT yet investigated: flash-side MSPI setup. IDF's bootloader configures
- * flash MSPI before PSRAM and the two share the controller; we leave flash
- * as the ROM set it (40 MHz DIO). That is the most promising next thread.
+ * docs/PSRAM-200MHZ.md is the full account: every measurement, every wrong
+ * answer, and what the working register state looks like.
  *
- * 80 MHz passes a walking-address test over all 32 MB, twice -- once with the
- * CPU at 40 MHz and again at 360 MHz. It selects MPLL 320 with a bus divider
- * of 4 (AP_HEX_PSRAM_MPLL_DEFAULT_FREQ_MHZ is 320 for 80M, 400 for 200M).
- *
- * To retry 200: flip both symbols below and watch step 6. It reports the
- * failure rate and the first four bad words, which is what makes the 8-byte
- * offset visible at all.
+ * Verified after both fixes: the walking-address test passes over all 32 MB,
+ * six cold boots out of six, and Linux runs on it -- memtester clean, and
+ * 6 MB of it takes 104 s where 80 MHz took 159 s.
  *
  * 120 and 160 MHz are not options. The Kconfig choice offers only 20/80/200/
  * 250, and the latency constants have exactly three branches (250M, 200M,
  * else) -- an in-between speed would silently use the 10-cycle latencies
- * meant for 80 MHz. Given 200 already fails with a latency-shaped symptom,
- * inventing latency parameters is the wrong direction. */
-#define CONFIG_SPIRAM_SPEED_80M                 1
-#define CONFIG_SPIRAM_SPEED                     80
+ * meant for 80 MHz.
+ *
+ * 250 MHz is rev-3-only silicon (IDF gates SPIRAM_SPEED_250M on
+ * !ESP32P4_SELECTS_REV_LESS_V3) and this board is rev 1.0. 200 has no such
+ * gate. If this ever needs to go back to 80, both symbols below move
+ * together. */
+#define CONFIG_SPIRAM_SPEED_200M                1
+#define CONFIG_SPIRAM_SPEED                     200
 
 /* ---- flash ----------------------------------------------------------- */
 /* 40 MHz DIO, matching what the ROM was told at boot and what espflash writes

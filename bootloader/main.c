@@ -238,35 +238,52 @@ int main(void)
     ets_printf("p4boot: PSRAM %u KB mapped at 0x%08x (%d MHz)\r\n",
                (unsigned)(psram_bytes / 1024), P4_PSRAM_VADDR, CONFIG_SPIRAM_SPEED);
 
-    /* Step 6 runs BEFORE the CPU clock changes, so that the whole PSRAM
-     * sequence -- train, map, verify -- happens under one set of conditions.
-     * Testing at a different core clock than we trained at would leave an
-     * ambiguity if it failed. */
-    {
-        uint32_t bad0 = 0;
-        if (!p4_psram_test(psram_bytes, &bad0)) {
-            ets_printf("p4boot: PSRAM TEST FAILED at 0x%08x (CPU still %d MHz)\r\n",
-                       (unsigned)bad0, p4_clk_cpu_get_mhz());
-            for (;;) { }
-        }
-        ets_printf("p4boot: PSRAM %u KB verified at %d MHz CPU\r\n",
-                   (unsigned)(psram_bytes / 1024), p4_clk_cpu_get_mhz());
-    }
+    /* There used to be a PSRAM walking-address test here, before the CPU
+     * raise, so that train-map-verify all happened at one core clock.
+     *
+     * IT HAD TO GO, and the reason is the whole of why 200 MHz PSRAM did not
+     * work on this board. Nothing may write a BURST to PSRAM while the core
+     * is still at 40 MHz:
+     *
+     *   - single uncached 4-byte stores at 200 MHz are fine, every time
+     *   - the first cache-line writeback gets 48 of its 64 bytes onto the
+     *     chip and then stops
+     *   - after that the write channel is dead for the rest of the boot --
+     *     later writebacks write nothing at all, and even single uncached
+     *     stores stop working. Raising the CPU afterwards does not recover
+     *     it; the wedge is permanent.
+     *   - no error flag is raised. SPI_MEM_S_INT_RAW reads 0x18, which is
+     *     just "transaction ended" twice, before and after.
+     *
+     * A PSRAM burst cannot be paused once started, so the write data has to
+     * arrive from the AXI side at the bus rate. At 200 MHz that is 800 MB/s
+     * and a 40 MHz core cannot feed it; at 80 MHz the ratio is survivable,
+     * which is exactly why this was invisible until now. With the raise
+     * moved above the test, the same 64-byte writeback comes back with zero
+     * bytes wrong, three times running.
+     *
+     * The test itself is not lost -- it still runs below, after the raise,
+     * where it is also a better test, because that is the clock Linux will
+     * actually run at. */
 
-    /* Step 4b. CPU to its ceiling -- AFTER PSRAM, not before.
+    /* Step 4b. CPU to its ceiling -- AFTER PSRAM is trained, before it is
+     * written.
+     *
+     * ORDER MATTERS AND IT IS NARROW. The raise must come after PSRAM is
+     * trained and before PSRAM is written:
+     *
+     *   after training, because ESP-IDF's own order is unambiguous --
+     *   esp_psram_chip_init() at cpu_start.c:645, esp_clk_init() at 830 --
+     *   and because training at 360 MHz produced a PSRAM that answered every
+     *   read with the halfwords swapped;
+     *
+     *   before any burst write, because at 200 MHz a 40 MHz core cannot feed
+     *   one and the write channel wedges permanently. See the long note just
+     *   above.
      *
      * 360 MHz, not 400: IDF's Kconfig.cpu caps rev < 3 silicon at 360, and
      * this board is rev 1.0. rtc_clk_cpu_freq_mhz_to_config() refuses 400
-     * rather than mis-clocking, so the readback below is the check.
-     *
-     * ORDER MATTERS AND I HAD IT BACKWARDS. This used to run before PSRAM,
-     * on the reasoning that MSPI timing tables are indexed by core clock. That
-     * is true of the table-driven tuning schemes; the P4's PSRAM uses the DQS
-     * sweep in mspi_timing_by_dqs.c, which has no tables at all. Meanwhile
-     * ESP-IDF's own order is unambiguous -- esp_psram_chip_init() at
-     * cpu_start.c:645, esp_clk_init() at line 830 -- PSRAM first, CPU second.
-     * Training at 360 MHz produced a PSRAM that answered every read with the
-     * halfwords swapped. */
+     * rather than mis-clocking, so the readback below is the check. */
     ets_printf("p4boot: CPU at %d MHz, raising to %d...\r\n",
                p4_clk_cpu_get_mhz(), CPU_MHZ);
     if (p4_clk_cpu_set_mhz(CPU_MHZ)) {

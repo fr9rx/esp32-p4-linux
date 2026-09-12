@@ -26,7 +26,13 @@
  * uses the DQS sweep in mspi_timing_by_dqs.c, which has no tables. ESP-IDF's
  * own order settles it: esp_psram_chip_init() at cpu_start.c:645,
  * esp_clk_init() at 830. Training at 360 MHz produced a PSRAM that answered
- * every read with the halfwords swapped. */
+ * every read with the halfwords swapped.
+ *
+ * The CPU must then be raised BEFORE anything writes a burst here. At
+ * 200 MHz a 40 MHz core cannot feed a burst write and the write channel
+ * wedges permanently, silently, on the first cache-line writeback. So the
+ * window for the raise is narrow: after this call, before p4_psram_test().
+ * main.c holds the measurements and does it in that order. */
 bool p4_psram_init(size_t *out_bytes);
 
 /* Walking-ones test over the whole mapped window.
