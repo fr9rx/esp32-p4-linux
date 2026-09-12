@@ -173,10 +173,24 @@ $(TARGET).elf: $(OBJS) esp32p4.ld vendor/ld/esp32p4.rom.eco0_4.ld
 #                            that would otherwise be reading it.
 #   (no --merge)             --merge would prepend a bootloader and partition
 #                            table around the image. We ARE the bootloader.
+#
+# The size check afterwards is not decoration. We are written at 0x2000 and
+# the partition table lives at 0x8000, so the image has exactly 24576 bytes.
+# espflash will happily write straight through the table, and the failure
+# arrives one boot later as "no kernel partition (type 0x40)" -- which reads
+# like a flash or partition-table problem and is not one. Ask me how I know.
 $(TARGET).bin: $(TARGET).elf
 	$(ESPFLASH) save-image --chip esp32p4 --ignore-app-descriptor \
 	    -m $(FLASH_MODE) -f $(FLASH_FREQ) -s $(FLASH_SIZE) \
 	    $< $@
+	@sz=`wc -c < $@`; \
+	 if [ $$sz -gt 24576 ]; then \
+	     echo "*** $@ is $$sz bytes; 0x2000 + $$sz runs past the partition"; \
+	     echo "*** table at 0x8000. Budget is 24576. Shrink before flashing."; \
+	     rm -f $@; exit 1; \
+	 else \
+	     echo "  $@: $$sz / 24576 bytes to the partition table at 0x8000"; \
+	 fi
 
 # The SRAM budget check. Our region stops at 0x4ff29000 because the ROM keeps
 # its shared buffers, stacks and .bss above that on rev <= ECO4 -- and we are
